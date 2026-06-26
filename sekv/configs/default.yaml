@@ -1,0 +1,75 @@
+model:
+  name: llama-3.2-3b
+  hf_id: null
+  dtype: bfloat16
+  device_map: auto
+  attn_implementation: eager
+
+segmentation:
+  alpha: 1.0
+  l_min: 4
+
+memory:
+  r_max: 32
+  summary_dim: 32
+
+routing:
+  tau_init: 0.05
+  ste_temperature: 0.1
+
+loss:
+  lambda_zoom: 1.0
+  lambda_recon: 0.5
+  lambda_budget: 0.1
+  beta: 0.1
+  w_pos: 10.0
+  rho: 0.9
+
+train:
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_steps: 3000
+  batch_size: 8
+  curriculum: [8192, 16384, 32768]
+  mining_window: 512
+  budget_anneal_frac: 0.5
+
+paths:
+  output_dir: outputs
+  data_dir: data
+  checkpoint_dir: checkpoints
+
+eval:
+  benchmarks: [longbench, ruler, niah, infinitebench, gsm8k]
+  data_dir: data
+  max_samples_per_task: null
+  budgets: [null, 512, 1024, 2048]
+  tensor_parallel_threshold: 24000
+  output_dir: outputs/eval
+  longbench_dataset: THUDM/LongBench
+  longbench_tasks:
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  infinitebench_dataset: yinoc/infinitebench
+  gsm8k_dataset: openai/gsm8k
+  ruler_lengths: [4096, 8192, 16384, 32768]
+  niah_lengths: [4096, 8192, 16384, 32768]
+  niah_depths: [0.1, 0.3, 0.5, 0.7, 0.9]
+  random_seed: 1234
+  gsm8k_few_shot: false
+  gsm8k_few_shot_k: 4

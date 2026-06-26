@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sekv"
+version = "0.1.0"
+description = "SeKV: entropy-guided span memory and mixed-resolution attention"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "SeKV" }]
+dependencies = [
+  "torch>=2.2",
+  "transformers>=4.44,<4.58",
+  "datasets>=2.19",
+  "pyyaml>=6.0",
+  "packaging>=24.0",
+]
+
+[project.optional-dependencies]
+eval = [
+  "numpy>=1.26",
+]
+
+[project.scripts]
+sekv-train = "sekv.train:main"
+sekv-generate = "sekv.generate:main"
+sekv-eval = "sekv.eval.run_eval:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sekv*"]
