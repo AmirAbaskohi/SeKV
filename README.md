@@ -4,6 +4,9 @@
   </h1>
 
   <p>
+    <a href="https://arxiv.org/abs/2606.31145">
+    <img alt="arXiv" src="https://img.shields.io/badge/arXiv-paper-b31b1b.svg">
+    </a>
     <img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-blue.svg">
     <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg">
     <img alt="Transformers" src="https://img.shields.io/badge/transformers-%E2%89%A54.51-yellow.svg">
@@ -217,6 +220,19 @@ Each request flows through these stages:
 5. STE zoom decision: select spans for reconstruction under thresholds and optional budget.
 6. Async SVD prefetch: stage selected span factors from CPU to GPU in advance.
 7. Mixed-resolution single softmax: attend jointly over anchors, summaries, full-res spans, and reconstructed tokens to produce next-token logits.
+
+## Citation
+```
+@misc{abaskohi2026sekvresolutionadaptivekvcache,
+      title={SeKV: Resolution-Adaptive KV Cache with Hierarchical Semantic Memory for Long-Context LLM Inference}, 
+      author={Amirhossein Abaskohi and Giuseppe Carenini and Peter West and Yuhang He},
+      year={2026},
+      eprint={2606.31145},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2606.31145}, 
+}
+```
 
 ## License
 
