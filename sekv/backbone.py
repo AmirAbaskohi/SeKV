@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib.metadata import version as pkg_version
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from packaging.version import Version
@@ -32,7 +32,7 @@ MODEL_REGISTRY: dict[str, str] = {
     "llama-3.2-3b": "meta-llama/Llama-3.2-3B-Instruct",
     "llama-3-8b-base": "meta-llama/Meta-Llama-3-8B",
     "llama-3.1-8b": "meta-llama/Llama-3.1-8B-Instruct",
-    "mistral-7b": "mistralai/Mistral-7B-Instruct-v0.2",
+    "mistral-7b": "mistralai/Mistral-7B-Instruct-v0.3",
     "qwen2.5-14b": "Qwen/Qwen2.5-14B-Instruct",
 }
 
@@ -51,9 +51,26 @@ class ModelSpec:
 
 @dataclass(frozen=True)
 class PrefillOutputs:
+    # Per-layer post-RoPE keys and values, each [H_kv, seq_len, d_h].
     keys: tuple[torch.Tensor, ...]
     values: tuple[torch.Tensor, ...]
-    next_token_logits: torch.Tensor
+    # Token surprisal H_t = -log p(x_t | x_<t) in nats on CPU, [seq_len], with H_0 = 0.
+    surprisal: torch.Tensor
+    # Next-token logits after the last prompt token, [vocab] fp32.
+    last_logits: torch.Tensor
+    # Final (post-norm) hidden states [seq_len, hidden]; only kept when requested.
+    final_hidden: Optional[torch.Tensor] = None
+    # Pre-RoPE query vectors per layer at query_positions, each [C, H, d_h]; only when requested.
+    query_positions: tuple[int, ...] = ()
+    queries: Optional[tuple[torch.Tensor, ...]] = None
+
+    @property
+    def seq_len(self) -> int:
+        return int(self.surprisal.numel())
+
+    @property
+    def device(self) -> torch.device:
+        return self.keys[0].device
 
 
 def _require_int_attr(config: Any, attr: str, hf_id: str) -> int:
@@ -196,8 +213,8 @@ class FrozenBackbone:
             sliding_window = getattr(hf_config, "sliding_window", None)
             if sliding_window:
                 raise ValueError(
-                    "Mistral-7B-Instruct-v0.2 config has sliding_window enabled, but SeKV Phase 1 "
-                    "assumes full attention spans. Please use a full-attention variant."
+                    "The Mistral checkpoint config has sliding_window enabled, but SeKV "
+                    "assumes full attention spans. Please use a full-attention variant (e.g. v0.3)."
                 )
 
         self._tokenizer = AutoTokenizer.from_pretrained(hf_id, use_fast=True)
@@ -248,8 +265,32 @@ class FrozenBackbone:
             raise IndexError(f"Query head index out of range: {h}")
         return h // self._spec.group_size
 
+    def lm_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Apply the LM head to final (post-norm) hidden states [..., hidden] -> fp32 logits."""
+        head = self._model.lm_head
+        return head(hidden.to(device=head.weight.device, dtype=head.weight.dtype)).to(dtype=torch.float32)
+
+    def _chunked_surprisal(self, hidden: torch.Tensor, ids: torch.Tensor, chunk: int) -> torch.Tensor:
+        # The LM head is applied in chunks so [seq_len, vocab] logits are never materialized at once.
+        seq_len = int(ids.numel())
+        surprisal = torch.zeros(seq_len, dtype=torch.float32)
+        for start in range(0, seq_len - 1, chunk):
+            stop = min(seq_len - 1, start + chunk)
+            log_probs = torch.log_softmax(self.lm_logits(hidden[start:stop]), dim=-1)
+            target = ids[start + 1 : stop + 1].to(device=log_probs.device, dtype=torch.long)
+            realized = log_probs.gather(dim=1, index=target.unsqueeze(1)).squeeze(1)
+            surprisal[start + 1 : stop + 1] = (-realized).to(device="cpu", dtype=torch.float32)
+        return surprisal
+
     @torch.no_grad()
-    def prefill(self, input_ids: torch.Tensor) -> PrefillOutputs:
+    def prefill(
+        self,
+        input_ids: torch.Tensor,
+        keep_hidden: bool = False,
+        query_positions: Optional[list[int]] = None,
+        surprisal_chunk: int = 1024,
+    ) -> PrefillOutputs:
+        """Full-KV prefill returning post-RoPE K/V, surprisal, and optional teacher-side tensors."""
         if input_ids.ndim != 2:
             raise ValueError(
                 f"input_ids must have shape [batch, seq_len], got {tuple(input_ids.shape)}"
@@ -261,22 +302,43 @@ class FrozenBackbone:
 
         model_input_device = _resolve_model_input_device(self._model)
         input_ids = input_ids.to(device=model_input_device)
+        seq_len = int(input_ids.size(1))
 
-        outputs = self._model(
-            input_ids=input_ids,
-            use_cache=True,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        positions = [int(p) for p in (query_positions or [])]
+        for pos in positions:
+            if pos < 0 or pos >= seq_len:
+                raise ValueError(f"query position {pos} out of range for seq_len={seq_len}")
 
-        # We deliberately read post-RoPE keys from past_key_values so reconstructed tokens
-        # re-enter attention directly in query space without re-applying rotary embedding.
-        # Value states are position-free and are consumed as-is.
-        # For Qwen2.5, QKV bias is already baked into these K/V states, so downstream
-        # summary/SVD operations should use them directly without bias stripping.
+        captured: list[Optional[torch.Tensor]] = [None] * self._num_layers
+        hooks = []
+        if positions:
+            spec = self._spec
+
+            def _make_hook(layer_idx: int):
+                def _hook(_module, _inputs, output):
+                    idx = torch.tensor(positions, dtype=torch.long, device=output.device)
+                    rows = output[0].index_select(0, idx)
+                    captured[layer_idx] = rows.view(len(positions), spec.num_q_heads, spec.head_dim).detach()
+
+                return _hook
+
+            for layer_idx, layer in enumerate(self._model.model.layers):
+                hooks.append(layer.self_attn.q_proj.register_forward_hook(_make_hook(layer_idx)))
+
+        try:
+            # Run the decoder core only: full logits are never needed, surprisal uses a chunked LM head.
+            outputs = self._model.model(input_ids=input_ids, use_cache=True, return_dict=True)
+        finally:
+            for hook in hooks:
+                hook.remove()
+
+        hidden = outputs.last_hidden_state[0]
+
+        # Keys are read post-RoPE from the cache (Qwen2 QKV bias already included). Span factors are
+        # computed on pre-RoPE keys obtained by inverting RoPE in memory.py.
         key_cache, value_cache = _extract_post_rope_kv(outputs.past_key_values, self._num_layers)
 
-        target_device = outputs.logits.device
+        target_device = hidden.device
         keys: list[torch.Tensor] = []
         values: list[torch.Tensor] = []
 
@@ -295,10 +357,23 @@ class FrozenBackbone:
             keys.append(key_states[0].to(device=target_device).contiguous())
             values.append(value_states[0].to(device=target_device).contiguous())
 
+        surprisal = self._chunked_surprisal(hidden, input_ids[0], chunk=max(1, int(surprisal_chunk)))
+        last_logits = self.lm_logits(hidden[-1:])[0]
+
+        queries = None
+        if positions:
+            if any(q is None for q in captured):
+                raise RuntimeError("Failed to capture query projections for all layers")
+            queries = tuple(q.to(device=target_device) for q in captured)  # type: ignore[union-attr]
+
         return PrefillOutputs(
             keys=tuple(keys),
             values=tuple(values),
-            next_token_logits=outputs.logits[0].to(device=target_device).contiguous(),
+            surprisal=surprisal,
+            last_logits=last_logits,
+            final_hidden=hidden.contiguous() if keep_hidden else None,
+            query_positions=tuple(positions),
+            queries=queries,
         )
 
 

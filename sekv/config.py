@@ -17,14 +17,24 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class SegmentationConfig:
+    # Boundary threshold is mu + alpha * sigma over the sequence surprisal.
     alpha: float
+    # Boundaries closer than l_gap tokens are merged, keeping the highest-surprisal one.
+    l_gap: int
+    # Spans shorter than l_min tokens stay exact on GPU.
     l_min: int
 
 
 @dataclass(frozen=True)
 class MemoryConfig:
+    # Maximum rank of the truncated SVD of each span's keys / values.
     r_max: int
+    # Routing-space dimension d'.
     summary_dim: int
+    # Most recent tokens kept as exact KV on GPU (w).
+    local_window: int
+    # Singular components whose learned gate m_i falls below this are dropped from CPU storage.
+    gate_eps: float
 
 
 @dataclass(frozen=True)
@@ -51,7 +61,10 @@ class TrainConfig:
     max_steps: int
     batch_size: int
     curriculum: list[int]
-    mining_window: int
+    # Candidate query positions per sequence for which teacher attention rows are computed.
+    query_candidates: int
+    # Positions kept per sequence: those whose teacher attention falls most outside the local window.
+    queries_per_seq: int
     budget_anneal_frac: float
 
 
@@ -78,7 +91,8 @@ class EvalConfig:
     benchmarks: list[str]
     data_dir: str
     max_samples_per_task: Optional[int]
-    budgets: list[Optional[int]]
+    # None = no cap; value <= 1 = fraction of Full-KV tokens; value > 1 = tokens per KV head per layer.
+    budgets: list[Optional[float]]
     tensor_parallel_threshold: int
     output_dir: str
     longbench_dataset: str
@@ -208,6 +222,8 @@ def load_config(path: str, overrides: dict | None = None) -> SeKVConfig:
         raise TypeError(f"Top-level config must be a mapping, got {type(loaded).__name__}")
 
     data: dict[str, Any] = dict(loaded)
+    # The optional `eval` section is read separately by load_eval_config.
+    data.pop("eval", None)
 
     if overrides is not None:
         if not isinstance(overrides, dict):

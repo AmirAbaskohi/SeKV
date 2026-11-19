@@ -1,17 +1,15 @@
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 
 import torch
 from transformers import PreTrainedModel
 
 from sekv.backbone import FrozenBackbone, ModelSpec
+from sekv.rope import apply_rope, rotate_half
 
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.size(-1) // 2]
-    x2 = x[..., x.size(-1) // 2 :]
-    return torch.cat([-x2, x1], dim=-1)
+__all__ = ["ArchAdapter", "build_arch_adapter", "rotate_half"]
 
 
 class ArchAdapter(ABC):
@@ -25,6 +23,45 @@ class ArchAdapter(ABC):
         self.core = model.model
         if not hasattr(self.core, "layers"):
             raise RuntimeError("Expected decoder stack at model.model.layers")
+        self._rotary = self._find_rotary()
+        self._rotary_takes_position_ids = "position_ids" in inspect.signature(self._rotary.forward).parameters
+
+    def _find_rotary(self):
+        rotary = getattr(self.core, "rotary_emb", None)
+        if rotary is None:
+            rotary = getattr(self.core.layers[0].self_attn, "rotary_emb", None)
+        if rotary is None:
+            raise RuntimeError("Could not locate the rotary embedding module on the backbone")
+        return rotary
+
+    def rope_cos_sin(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the backbone's RoPE (cos, sin), each [n, d_h] fp32, for absolute positions [n]."""
+        inv_freq = getattr(self._rotary, "inv_freq", None)
+        device = inv_freq.device if isinstance(inv_freq, torch.Tensor) else positions.device
+        pos = positions.reshape(-1).to(device=device, dtype=torch.long)
+        n = int(pos.numel())
+        dummy = torch.zeros((1, 1, n, self.spec.head_dim), device=device, dtype=torch.float32)
+        if self._rotary_takes_position_ids:
+            cos, sin = self._rotary(dummy, pos.unsqueeze(0))
+            cos = cos.reshape(n, -1)
+            sin = sin.reshape(n, -1)
+        else:
+            seq_len = int(pos.max().item()) + 1 if n > 0 else 1
+            cos, sin = self._rotary(dummy, seq_len=seq_len)
+            cos = cos.reshape(-1, cos.size(-1)).index_select(0, pos)
+            sin = sin.reshape(-1, sin.size(-1)).index_select(0, pos)
+        return cos.to(dtype=torch.float32), sin.to(dtype=torch.float32)
+
+    def apply_rope(self, x: torch.Tensor, position: int) -> torch.Tensor:
+        """Apply RoPE at one absolute position to per-head vectors x:[heads, d_h]."""
+        pos = torch.tensor([int(position)], dtype=torch.long, device=x.device)
+        cos, sin = self.rope_cos_sin(pos)
+        return apply_rope(x, cos, sin)
+
+    def apply_rope_q(self, layer: int, q: torch.Tensor, position: int) -> torch.Tensor:
+        """Apply architecture RoPE to q at absolute decode position."""
+        del layer
+        return self.apply_rope(q, position)
 
     @abstractmethod
     def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -33,10 +70,6 @@ class ArchAdapter(ABC):
     @abstractmethod
     def project_qkv(self, layer: int, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return q:[H,d_h], k:[H_kv,d_h], v:[H_kv,d_h] before RoPE."""
-
-    @abstractmethod
-    def apply_rope_q(self, layer: int, q: torch.Tensor, position: int) -> torch.Tensor:
-        """Apply architecture RoPE to q at absolute decode position."""
 
     @abstractmethod
     def input_layernorm(self, layer: int, hidden: torch.Tensor) -> torch.Tensor:

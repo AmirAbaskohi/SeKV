@@ -47,7 +47,7 @@ else
         ;;
       *)
         echo "Unknown argument: $1"
-        echo "Usage: $0 --prompt <text> --checkpoint <path> [--budget <int|none>] [--max-new-tokens <int>] [--config <path>] [--model <model_key>]"
+        echo "Usage: $0 --prompt <text> --checkpoint <path> [--budget <fraction|tokens|none>] [--max-new-tokens <int>] [--config <path>] [--model <model_key>]"
         echo "   or: $0 <checkpoint_path> <prompt> [max_new_tokens] [budget] [config_path]"
         exit 1
         ;;
@@ -57,7 +57,7 @@ fi
 
 if [[ -z "$CHECKPOINT" || -z "$PROMPT" ]]; then
   echo "Missing required args: --checkpoint and --prompt"
-  echo "Usage: $0 --prompt <text> --checkpoint <path> [--budget <int|none>] [--max-new-tokens <int>] [--config <path>] [--model <model_key>]"
+  echo "Usage: $0 --prompt <text> --checkpoint <path> [--budget <fraction|tokens|none>] [--max-new-tokens <int>] [--config <path>] [--model <model_key>]"
   exit 1
 fi
 

@@ -9,11 +9,12 @@ from typing import Any
 
 import torch
 
+from sekv.attention import BudgetTooSmallError
 from sekv.backbone import FrozenBackbone
 from sekv.config import EvalConfig, ModelConfig, SeKVConfig, load_config, load_eval_config
 from sekv.eval.efficiency import EfficiencyRecord, track_efficiency
 from sekv.eval.registry import Benchmark, get_benchmark
-from sekv.generate import GenerationConfig, generate_text, load_sekv_checkpoint
+from sekv.generate import GenerationConfig, generate_text, load_sekv_checkpoint, resolve_budget
 
 # Import side-effect registrations.
 from sekv.eval import benchmarks as _benchmarks  # noqa: F401
@@ -63,32 +64,37 @@ def _estimate_prompt_len(backbone: FrozenBackbone, prompt: str, apply_chat_templ
     return int(ids.size(-1))
 
 
-def _summarize_efficiency(records: list[EfficiencyRecord], budget: int | None) -> dict:
+def _budget_key(budget: float | None) -> str:
+    if budget is None:
+        return "none"
+    value = float(budget)
+    return f"{value:g}" if value <= 1.0 else str(int(value))
+
+
+def _summarize_efficiency(records: list[EfficiencyRecord], budget: float | None) -> dict:
     if not records:
         return {
-            "peak_resident_kv_tokens": 0,
+            "peak_resident_kv_tokens": 0.0,
             "mean_resident_kv_tokens": 0.0,
             "mean_expansion_rate": 0.0,
             "mean_effective_rank": 0.0,
+            "mean_h2d_bytes_per_step": 0.0,
+            "mean_reuse_rate": 0.0,
             "peak_gpu_mem_bytes": 0,
             "budget": budget,
         }
 
-    peak = max(r.peak_resident_kv_tokens for r in records)
-    mean_resident = sum(r.mean_resident_kv_tokens for r in records) / len(records)
-    mean_expand = sum(r.mean_expansion_rate for r in records) / len(records)
-    mean_rank = sum(r.mean_effective_rank for r in records) / len(records)
-    peak_mem = max(r.peak_gpu_mem_bytes for r in records)
-
-    if budget is not None and peak > budget:
-        raise AssertionError(f"Peak residency {peak} exceeded budget {budget}")
+    def _mean(attr: str) -> float:
+        return sum(getattr(r, attr) for r in records) / len(records)
 
     return {
-        "peak_resident_kv_tokens": int(peak),
-        "mean_resident_kv_tokens": float(mean_resident),
-        "mean_expansion_rate": float(mean_expand),
-        "mean_effective_rank": float(mean_rank),
-        "peak_gpu_mem_bytes": int(peak_mem),
+        "peak_resident_kv_tokens": float(max(r.peak_resident_kv_tokens for r in records)),
+        "mean_resident_kv_tokens": _mean("mean_resident_kv_tokens"),
+        "mean_expansion_rate": _mean("mean_expansion_rate"),
+        "mean_effective_rank": _mean("mean_effective_rank"),
+        "mean_h2d_bytes_per_step": _mean("mean_h2d_bytes_per_step"),
+        "mean_reuse_rate": _mean("mean_reuse_rate"),
+        "peak_gpu_mem_bytes": int(max(r.peak_gpu_mem_bytes for r in records)),
         "budget": budget,
     }
 
@@ -99,11 +105,15 @@ def evaluate_benchmark(
     benchmark: Benchmark,
     cfg: SeKVConfig,
     eval_cfg: EvalConfig,
-    budget: int | None,
+    budget: float | None,
 ) -> dict:
-    """Run one benchmark under one budget and return metrics + per-sample efficiency."""
+    """Run one benchmark under one budget and return metrics + per-sample efficiency.
+
+    Inputs too short for SeKV's resident state to fit in the budget are excluded and counted.
+    """
     per_sample_rows: list[dict] = []
     eff_records: list[EfficiencyRecord] = []
+    excluded: list[str] = []
 
     apply_chat_template = backbone.spec.is_instruct
 
@@ -116,17 +126,20 @@ def evaluate_benchmark(
             eos_token_id=backbone.tokenizer.eos_token_id,
         )
 
-        track_budget = budget if strategy == "single" else None
-        with track_efficiency(budget=track_budget, seq_len=seq_len) as handle:
-            prediction = generate_text(
-                backbone=backbone,
-                modules=modules,
-                prompt=sample.prompt,
-                cfg=cfg,
-                gen_cfg=gen_cfg,
-                apply_chat_template=apply_chat_template,
-                residency_callback=handle.callback if strategy == "single" else None,
-            )
+        try:
+            with track_efficiency(budget=resolve_budget(budget, seq_len), seq_len=seq_len) as handle:
+                prediction = generate_text(
+                    backbone=backbone,
+                    modules=modules,
+                    prompt=sample.prompt,
+                    cfg=cfg,
+                    gen_cfg=gen_cfg,
+                    apply_chat_template=apply_chat_template,
+                    residency_callback=handle.callback if strategy == "single" else None,
+                )
+        except BudgetTooSmallError:
+            excluded.append(sample.sample_id)
+            continue
 
         if handle.record is None:
             raise RuntimeError("Efficiency tracking did not produce a record")
@@ -145,6 +158,7 @@ def evaluate_benchmark(
     return {
         "aggregate": benchmark.aggregate(per_sample_rows),
         "efficiency": _summarize_efficiency(eff_records, budget=budget),
+        "excluded_below_resident_floor": excluded,
         "per_sample": per_sample_rows,
     }
 
@@ -165,7 +179,7 @@ def run_eval(cfg: SeKVConfig, eval_cfg: EvalConfig, checkpoint: str) -> dict:
 
         bench_results: dict[str, Any] = {}
         for budget in eval_cfg.budgets:
-            key = "none" if budget is None else str(int(budget))
+            key = _budget_key(budget)
             result = evaluate_benchmark(
                 backbone=backbone,
                 modules=modules,
@@ -189,17 +203,17 @@ def run_eval(cfg: SeKVConfig, eval_cfg: EvalConfig, checkpoint: str) -> dict:
     return all_results
 
 
-def _parse_optional_budgets(raw: str | None) -> list[int | None] | None:
+def _parse_optional_budgets(raw: str | None) -> list[float | None] | None:
     if raw is None or raw.strip() == "":
         return None
 
-    values: list[int | None] = []
+    values: list[float | None] = []
     for part in raw.split(","):
         p = part.strip().lower()
         if p in {"none", "null"}:
             values.append(None)
         else:
-            values.append(int(p))
+            values.append(float(p))
     return values
 
 

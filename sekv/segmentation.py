@@ -10,8 +10,23 @@ from sekv.config import SegmentationConfig
 
 @dataclass(frozen=True)
 class Span:
-    token_indices: list[int]
+    """Contiguous tokens [start, stop) between two consecutive anchors."""
+
+    start: int
+    stop: int
     full_resolution: bool
+
+    @property
+    def length(self) -> int:
+        return self.stop - self.start
+
+    @property
+    def last(self) -> int:
+        return self.stop - 1
+
+    @property
+    def token_indices(self) -> list[int]:
+        return list(range(self.start, self.stop))
 
 
 @dataclass(frozen=True)
@@ -23,199 +38,111 @@ class SegmentationResult:
     boundary_threshold: float
 
 
-def _normalize_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
-    if input_ids.ndim == 2:
-        if input_ids.size(0) != 1:
-            raise ValueError(
-                f"input_ids must be shape [seq_len] or [1, seq_len], got {tuple(input_ids.shape)}"
-            )
-        input_ids = input_ids[0]
-    elif input_ids.ndim != 1:
-        raise ValueError(
-            f"input_ids must be shape [seq_len] or [1, seq_len], got {tuple(input_ids.shape)}"
-        )
+@dataclass(frozen=True)
+class MemoryLayout:
+    """Causal view of a segmented sequence for a query at `query_position`.
 
-    if input_ids.dtype not in {
-        torch.int8,
-        torch.int16,
-        torch.int32,
-        torch.int64,
-        torch.uint8,
-    }:
-        raise TypeError(f"input_ids must be an integer tensor, got dtype {input_ids.dtype}")
+    Anchors and spans that lie entirely before the local window form a prefix of the
+    segmentation (`num_anchors`, `num_spans`); every token in [window_start, query_position]
+    is kept as exact KV in the local window.
+    """
 
-    return input_ids.contiguous()
+    num_anchors: int
+    num_spans: int
+    window_start: int
+    query_position: int
 
 
-def _validate_spans(spans: list[Span], l_min: int) -> None:
-    prev_last = -1
+def _validate_partition(seq_len: int, anchors: list[int], spans: list[Span], l_min: int) -> None:
+    if anchors != sorted(set(anchors)):
+        raise ValueError("anchor_indices must be strictly ascending")
+
+    elements: list[tuple[int, int]] = [(a, a + 1) for a in anchors]
     for idx, span in enumerate(spans):
-        token_indices = span.token_indices
-        if not token_indices:
+        if span.length <= 0:
             raise ValueError(f"Span {idx} is empty; empty spans are not allowed")
-
-        for pos in token_indices:
-            if not isinstance(pos, int):
-                raise TypeError(f"Span {idx} contains non-int token index: {type(pos).__name__}")
-
-        start = token_indices[0]
-        end = token_indices[-1]
-        expected = list(range(start, end + 1))
-        if token_indices != expected:
-            raise ValueError(f"Span {idx} token_indices must be contiguous and ascending")
-
-        if start <= prev_last:
-            raise ValueError(f"Spans overlap or are not strictly ascending at span {idx}")
-
-        expected_full_resolution = len(token_indices) < l_min
-        if span.full_resolution != expected_full_resolution:
+        if span.full_resolution != (span.length < l_min):
             raise ValueError(
-                f"Span {idx} full_resolution mismatch: expected {expected_full_resolution}, "
+                f"Span {idx} full_resolution mismatch: expected {span.length < l_min}, "
                 f"got {span.full_resolution}"
             )
+        elements.append((span.start, span.stop))
 
-        prev_last = end
+    elements.sort()
+    cursor = 0
+    for start, stop in elements:
+        if start != cursor:
+            raise ValueError(f"Invalid partition of sequence positions at token {cursor}")
+        cursor = stop
+    if cursor != seq_len:
+        raise ValueError(f"Invalid partition: covered {cursor} of {seq_len} positions")
 
 
-def _assert_exact_partition(seq_len: int, anchors: list[int], spans: list[Span]) -> None:
-    anchor_set = set(anchors)
+def _merge_close_boundaries(candidates: list[int], surprisal: torch.Tensor, l_gap: int) -> list[int]:
+    """Keep the highest-surprisal boundary among any boundaries closer than l_gap tokens."""
+    if l_gap <= 1 or not candidates:
+        return sorted(candidates)
 
-    if len(anchor_set) != len(anchors):
-        raise ValueError("anchor_indices must not contain duplicates")
-    if anchors != sorted(anchors):
-        raise ValueError("anchor_indices must be ascending")
-    for anchor in anchors:
-        if anchor < 0 or anchor >= seq_len:
-            raise ValueError(f"Anchor index out of bounds: {anchor}")
-
-    span_positions: set[int] = set()
-    for idx, span in enumerate(spans):
-        for pos in span.token_indices:
-            if pos < 0 or pos >= seq_len:
-                raise ValueError(f"Span {idx} contains out-of-bounds position: {pos}")
-            if pos in span_positions:
-                raise ValueError(f"Span positions overlap at token index {pos}")
-            span_positions.add(pos)
-
-    if span_positions & anchor_set:
-        overlap = min(span_positions & anchor_set)
-        raise ValueError(f"Spans and anchors overlap at token index {overlap}")
-
-    # Zero-boundary convention: when no anchors are detected, SeKV may keep position 0
-    # outside span decomposition and segment only positions [1..seq_len-1].
-    if seq_len > 0 and not anchors:
-        if (
-            len(spans) == 1
-            and spans[0].token_indices
-            and spans[0].token_indices[0] == 1
-            and spans[0].token_indices[-1] == seq_len - 1
-        ):
-            anchor_set = {0}
-
-    covered = span_positions | anchor_set
-    expected = set(range(seq_len))
-    if covered != expected:
-        missing = sorted(expected - covered)
-        extra = sorted(covered - expected)
-        raise ValueError(
-            f"Invalid partition of sequence positions. Missing={missing}, Extra={extra}"
-        )
+    values = surprisal.tolist()
+    order = sorted(candidates, key=lambda pos: values[pos], reverse=True)
+    blocked = bytearray(len(values))
+    kept: list[int] = []
+    for pos in order:
+        if blocked[pos]:
+            continue
+        kept.append(pos)
+        lo = max(0, pos - l_gap + 1)
+        hi = min(len(values), pos + l_gap)
+        blocked[lo:hi] = b"\x01" * (hi - lo)
+    return sorted(kept)
 
 
 def compute_surprisal(prefill: PrefillOutputs, input_ids: torch.Tensor) -> torch.Tensor:
-    """Return [seq_len] surprisal in nats, H_t = -log p(realized token t | t_<t), with H_0=0."""
-    ids = _normalize_input_ids(input_ids)
-    seq_len = int(ids.numel())
-
-    logits = prefill.next_token_logits
-    if logits.ndim != 2:
+    """Return [seq_len] surprisal in nats, H_t = -log p(x_t | x_<t), with H_0=0."""
+    ids = input_ids.reshape(-1)
+    if int(ids.numel()) != prefill.seq_len:
         raise ValueError(
-            f"prefill.next_token_logits must have shape [seq_len, vocab], got {tuple(logits.shape)}"
+            f"Prefill length ({prefill.seq_len}) does not match input_ids length ({ids.numel()})"
         )
-    if logits.size(0) != seq_len:
-        raise ValueError(
-            f"Logit length ({logits.size(0)}) does not match input_ids length ({seq_len})"
-        )
-
-    surprisal = torch.zeros(seq_len, dtype=torch.float32, device="cpu")
-    if seq_len <= 1:
-        return surprisal
-
-    ids_for_gather = ids.to(device=logits.device, dtype=torch.long)
-    log_probs = torch.log_softmax(logits.to(dtype=torch.float32), dim=-1)
-    realized_log_probs = log_probs[:-1].gather(dim=1, index=ids_for_gather[1:].unsqueeze(1)).squeeze(1)
-
-    surprisal[1:] = (-realized_log_probs).to(dtype=torch.float32, device="cpu")
-    return surprisal
+    return prefill.surprisal.to(device="cpu", dtype=torch.float32)
 
 
 def segment_sequence(surprisal: torch.Tensor, cfg: SegmentationConfig) -> SegmentationResult:
-    """Threshold at mu + alpha*sigma, emit anchors and the spans between them, flag spans shorter than l_min as full_resolution."""
+    """Mark H_t > mu + alpha*sigma as boundaries, merge boundaries closer than l_gap, and emit
+    anchors (boundary tokens) plus the spans between them. Position 0 starts the first segment
+    and is always an anchor. Spans shorter than l_min are flagged full_resolution."""
     if surprisal.ndim != 1:
         raise ValueError(f"surprisal must have shape [seq_len], got {tuple(surprisal.shape)}")
+    if cfg.l_min < 0 or cfg.l_gap < 0:
+        raise ValueError(f"l_min and l_gap must be >= 0, got {cfg.l_min} and {cfg.l_gap}")
 
     surprisal_cpu = surprisal.detach().to(device="cpu", dtype=torch.float32).contiguous()
     seq_len = int(surprisal_cpu.numel())
 
-    if cfg.l_min < 0:
-        raise ValueError(f"cfg.l_min must be >= 0, got {cfg.l_min}")
-
     if seq_len == 0:
-        return SegmentationResult(
-            seq_len=0,
-            surprisal=surprisal_cpu,
-            anchor_indices=[],
-            spans=[],
-            boundary_threshold=0.0,
-        )
+        return SegmentationResult(0, surprisal_cpu, [], [], 0.0)
 
     mu = float(surprisal_cpu.mean().item())
     sigma = float(surprisal_cpu.std(unbiased=False).item())
     boundary_threshold = mu + float(cfg.alpha) * sigma
 
-    anchor_mask = surprisal_cpu > boundary_threshold
-    anchor_indices = anchor_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
+    candidates = (surprisal_cpu > boundary_threshold).nonzero(as_tuple=False).squeeze(-1).tolist()
+    candidates = [int(pos) for pos in candidates if pos > 0]
+    anchors = [0] + _merge_close_boundaries(candidates, surprisal_cpu, int(cfg.l_gap))
 
     spans: list[Span] = []
+    for idx, anchor in enumerate(anchors):
+        start = anchor + 1
+        stop = anchors[idx + 1] if idx + 1 < len(anchors) else seq_len
+        if start < stop:
+            spans.append(Span(start=start, stop=stop, full_resolution=(stop - start) < cfg.l_min))
 
-    if not anchor_indices:
-        if seq_len < cfg.l_min:
-            all_indices = list(range(seq_len))
-            spans.append(Span(token_indices=all_indices, full_resolution=True))
-        else:
-            if seq_len > 1:
-                span_indices = list(range(1, seq_len))
-                spans.append(
-                    Span(token_indices=span_indices, full_resolution=(len(span_indices) < cfg.l_min))
-                )
-            elif seq_len == 1:
-                spans.append(Span(token_indices=[0], full_resolution=(1 < cfg.l_min)))
-    else:
-        prev_anchor = -1
-        for anchor in anchor_indices:
-            start = prev_anchor + 1
-            end = anchor - 1
-            if start <= end:
-                token_indices = list(range(start, end + 1))
-                spans.append(
-                    Span(token_indices=token_indices, full_resolution=(len(token_indices) < cfg.l_min))
-                )
-            prev_anchor = anchor
-
-        trail_start = prev_anchor + 1
-        if trail_start <= seq_len - 1:
-            token_indices = list(range(trail_start, seq_len))
-            spans.append(
-                Span(token_indices=token_indices, full_resolution=(len(token_indices) < cfg.l_min))
-            )
-
-    _validate_spans(spans, cfg.l_min)
-    _assert_exact_partition(seq_len=seq_len, anchors=anchor_indices, spans=spans)
+    _validate_partition(seq_len, anchors, spans, cfg.l_min)
 
     return SegmentationResult(
         seq_len=seq_len,
         surprisal=surprisal_cpu,
-        anchor_indices=[int(idx) for idx in anchor_indices],
+        anchor_indices=anchors,
         spans=spans,
         boundary_threshold=float(boundary_threshold),
     )
@@ -229,3 +156,32 @@ def segment_prefill(
     """Convenience: compute_surprisal then segment_sequence."""
     surprisal = compute_surprisal(prefill=prefill, input_ids=input_ids)
     return segment_sequence(surprisal=surprisal, cfg=cfg)
+
+
+def memory_layout(seg: SegmentationResult, query_position: int, local_window: int) -> MemoryLayout:
+    """Split the context of a query into compressed memory and the exact local window.
+
+    Elements (anchors and spans) that end before `query_position - local_window + 1` stay in
+    span memory; the remaining tokens up to and including the query form the local window.
+    """
+    if query_position < 0 or query_position >= seg.seq_len:
+        raise ValueError(f"query_position {query_position} out of range for seq_len={seg.seq_len}")
+    if local_window < 1:
+        raise ValueError(f"local_window must be >= 1, got {local_window}")
+
+    limit = max(0, query_position - local_window + 1)
+    num_anchors = sum(1 for a in seg.anchor_indices if a < limit)
+    num_spans = sum(1 for span in seg.spans if span.stop <= limit)
+
+    covered = -1
+    if num_anchors:
+        covered = max(covered, seg.anchor_indices[num_anchors - 1])
+    if num_spans:
+        covered = max(covered, seg.spans[num_spans - 1].last)
+
+    return MemoryLayout(
+        num_anchors=num_anchors,
+        num_spans=num_spans,
+        window_start=covered + 1,
+        query_position=int(query_position),
+    )

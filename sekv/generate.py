@@ -1,25 +1,53 @@
 from __future__ import annotations
 
-from collections import OrderedDict
-from dataclasses import asdict, dataclass
-from typing import Any, Callable
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, fields
+from typing import Any, Callable, Optional
 
 import torch
 
 from sekv.arch import ArchAdapter, build_arch_adapter
-from sekv.attention import budget_select, decode_step_layer
+from sekv.attention import BudgetTooSmallError, decode_step_layer, persistent_tokens
 from sekv.backbone import FrozenBackbone, ModelSpec
 from sekv.config import MemoryConfig, RoutingConfig, SeKVConfig, load_config
-from sekv.memory import LayerMemory, SpanFactors, SpanMemory, build_span_memory
+from sekv.memory import LayerMemory, SpanFactors, SpanMemory, build_span_memory, reconstruct_span_kv, roll_window
 from sekv.modules import SeKVModules
-from sekv.segmentation import segment_prefill
+from sekv.rope import RopeFn
+from sekv.segmentation import memory_layout, segment_sequence
 
 
 @dataclass(frozen=True)
 class GenerationConfig:
     max_new_tokens: int
-    budget: int | None
+    # None: no cap. Value <= 1: fraction of Full-KV (e.g. 0.1 = 10% GPU-resident KV budget).
+    # Value > 1: absolute cap in tokens per KV head per layer.
+    budget: float | int | None
     eos_token_id: int | None
+
+
+@dataclass
+class StepStats:
+    """Per decoding step: peak per-layer resident KV (tokens per KV head), mean share of
+    (span, head) decisions that zoom in, mean stored rank of reconstructed spans, host-to-device
+    bytes, and the share of reconstructed spans reused from the previous step."""
+
+    resident_kv_tokens: float
+    expansion_rate: float
+    effective_rank: float
+    h2d_bytes: int
+    reuse_rate: float
+
+
+def resolve_budget(budget: float | int | None, context_len: int) -> float | None:
+    """Convert a budget spec to tokens per KV head per layer."""
+    if budget is None:
+        return None
+    value = float(budget)
+    if value <= 0:
+        raise ValueError(f"budget must be positive, got {budget}")
+    if value <= 1.0:
+        return value * float(context_len)
+    return value
 
 
 def _ensure_1d_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
@@ -41,397 +69,194 @@ def _spec_as_dict(spec: ModelSpec | dict[str, Any]) -> dict[str, Any]:
 def _assert_spec_match(checkpoint_spec: ModelSpec | dict[str, Any], runtime_spec: ModelSpec) -> None:
     ck = _spec_as_dict(checkpoint_spec)
     rt = asdict(runtime_spec)
-
-    fields = [
-        "name",
-        "hf_id",
-        "num_layers",
-        "num_q_heads",
-        "num_kv_heads",
-        "head_dim",
-        "group_size",
-        "is_instruct",
+    mismatches = [
+        f"{name}: ckpt={ck.get(name)} runtime={rt.get(name)}"
+        for name in ("name", "hf_id", "num_layers", "num_q_heads", "num_kv_heads", "head_dim", "group_size", "is_instruct")
+        if ck.get(name) != rt.get(name)
     ]
-    mismatches: list[str] = []
-    for field in fields:
-        if ck.get(field) != rt.get(field):
-            mismatches.append(f"{field}: ckpt={ck.get(field)} runtime={rt.get(field)}")
-
     if mismatches:
-        mismatch_text = "; ".join(mismatches)
-        raise ValueError(f"Checkpoint ModelSpec mismatch with loaded backbone: {mismatch_text}")
+        raise ValueError(f"Checkpoint ModelSpec mismatch with loaded backbone: {'; '.join(mismatches)}")
 
 
-def _span_factors_to_device(factors: SpanFactors, device: torch.device, non_blocking: bool) -> SpanFactors:
-    return SpanFactors(
-        U_k=factors.U_k.to(device=device, dtype=torch.float32, non_blocking=non_blocking).contiguous(),
-        s_k=factors.s_k.to(device=device, dtype=torch.float32, non_blocking=non_blocking).contiguous(),
-        Vmat_k=factors.Vmat_k.to(device=device, dtype=torch.float32, non_blocking=non_blocking).contiguous(),
-        U_v=factors.U_v.to(device=device, dtype=torch.float32, non_blocking=non_blocking).contiguous(),
-        s_v=factors.s_v.to(device=device, dtype=torch.float32, non_blocking=non_blocking).contiguous(),
-        Vmat_v=factors.Vmat_v.to(device=device, dtype=torch.float32, non_blocking=non_blocking).contiguous(),
-        valid_rank=int(factors.valid_rank),
-    )
+def _section(cfg_obj: Any, name: str, cls: type) -> Any:
+    raw = getattr(cfg_obj, name, None) if not isinstance(cfg_obj, dict) else cfg_obj.get(name)
+    if isinstance(raw, cls):
+        return raw
+    if isinstance(raw, dict):
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in raw.items() if k in known})
+    raise KeyError(f"Checkpoint config is missing the '{name}' section")
 
 
 def load_sekv_checkpoint(path: str, backbone: FrozenBackbone) -> SeKVModules:
     """Load trainable params into SeKVModules and validate checkpoint spec against runtime spec."""
-    ckpt = torch.load(path, map_location="cpu")
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(ckpt, dict):
         raise ValueError(f"Checkpoint at {path} must be a dict payload")
-
-    if "model_spec" not in ckpt or "trainable_parameters" not in ckpt:
-        raise KeyError("Checkpoint must contain 'model_spec' and 'trainable_parameters'")
+    if "model_spec" not in ckpt or "trainable_parameters" not in ckpt or "config" not in ckpt:
+        raise KeyError("Checkpoint must contain 'model_spec', 'config', and 'trainable_parameters'")
 
     _assert_spec_match(ckpt["model_spec"], backbone.spec)
-
-    ckpt_cfg = ckpt.get("config")
-    if hasattr(ckpt_cfg, "routing") and hasattr(ckpt_cfg, "memory"):
-        routing_cfg = ckpt_cfg.routing
-        memory_cfg = ckpt_cfg.memory
-    elif isinstance(ckpt_cfg, dict) and "routing" in ckpt_cfg and "memory" in ckpt_cfg:
-        routing_raw = ckpt_cfg["routing"]
-        memory_raw = ckpt_cfg["memory"]
-        if isinstance(routing_raw, RoutingConfig):
-            routing_cfg = routing_raw
-        elif isinstance(routing_raw, dict):
-            routing_cfg = RoutingConfig(**routing_raw)
-        else:
-            raise TypeError("Checkpoint routing config must be RoutingConfig or dict")
-
-        if isinstance(memory_raw, MemoryConfig):
-            memory_cfg = memory_raw
-        elif isinstance(memory_raw, dict):
-            memory_cfg = MemoryConfig(**memory_raw)
-        else:
-            raise TypeError("Checkpoint memory config must be MemoryConfig or dict")
-    else:
-        raise KeyError(
-            "Checkpoint must include full config with 'routing' and 'memory' to rebuild SeKVModules"
-        )
+    routing_cfg = _section(ckpt["config"], "routing", RoutingConfig)
+    memory_raw = ckpt["config"]["memory"] if isinstance(ckpt["config"], dict) else ckpt["config"].memory
+    memory_dict = asdict(memory_raw) if not isinstance(memory_raw, dict) else dict(memory_raw)
+    memory_cfg = MemoryConfig(
+        r_max=int(memory_dict["r_max"]),
+        summary_dim=int(memory_dict["summary_dim"]),
+        local_window=int(memory_dict.get("local_window", 512)),
+        gate_eps=float(memory_dict.get("gate_eps", 0.05)),
+    )
 
     modules = SeKVModules(spec=backbone.spec, routing=routing_cfg, memory=memory_cfg)
-
-    # Rebuild modules with runtime config if checkpoint config isn't a dataclass tree.
-    if not isinstance(modules, SeKVModules):
-        raise RuntimeError("Failed to build SeKVModules")
-
     trainable = ckpt["trainable_parameters"]
-    if not isinstance(trainable, dict):
-        raise TypeError("Checkpoint 'trainable_parameters' must be a dict[str, Tensor]")
-
     state = modules.state_dict()
-    missing: list[str] = []
-    for name in state:
-        if name not in trainable:
-            missing.append(name)
-            continue
-        tensor = trainable[name]
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"Checkpoint parameter {name} must be a Tensor")
-        if tuple(tensor.shape) != tuple(state[name].shape):
-            raise ValueError(
-                f"Shape mismatch for {name}: ckpt {tuple(tensor.shape)} vs model {tuple(state[name].shape)}"
-            )
-        state[name] = tensor.to(dtype=state[name].dtype)
-
+    missing = [name for name in state if name not in trainable]
     if missing:
         raise KeyError(f"Checkpoint missing parameter(s): {', '.join(missing)}")
+    for name in state:
+        tensor = trainable[name]
+        if tuple(tensor.shape) != tuple(state[name].shape):
+            raise ValueError(f"Shape mismatch for {name}: ckpt {tuple(tensor.shape)} vs model {tuple(state[name].shape)}")
+        state[name] = tensor.to(dtype=state[name].dtype)
 
     modules.load_state_dict(state, strict=True)
     modules.eval()
     modules.to(device=backbone.model.device)
     for p in modules.parameters():
         p.requires_grad = False
-
     return modules
 
 
-class SVDPrefetcher:
-    """Async CPU->GPU prefetch for span factors with bounded LRU cache."""
+class ZoomCache:
+    """GPU-side zoom-in state.
 
-    def __init__(self, device, max_cached_spans: int):
-        self.device = device if isinstance(device, torch.device) else torch.device(device)
-        self.max_cached_spans = int(max_cached_spans)
-        if self.max_cached_spans <= 0:
-            raise ValueError(f"max_cached_spans must be > 0, got {max_cached_spans}")
+    Spans expanded at the previous step stay reconstructed on GPU and are reused; spans that stop
+    being expanded are released, so the cache always matches the current budget accounting. New
+    spans fetch only their KV group's factors (rank r_S) from pinned CPU memory on a side stream,
+    and factors are cast to the model dtype after transfer.
+    """
 
-        self.cuda_enabled = self.device.type == "cuda" and torch.cuda.is_available()
-        self.stream = torch.cuda.Stream(device=self.device) if self.cuda_enabled else None
+    def __init__(self, device: torch.device | str, rope_fn: RopeFn, dtype: torch.dtype):
+        self.device = torch.device(device)
+        self.rope_fn = rope_fn
+        self.dtype = dtype
+        self.cuda = self.device.type == "cuda" and torch.cuda.is_available()
+        self.stream = torch.cuda.Stream(device=self.device) if self.cuda else None
+        self._recon: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._inflight: dict[tuple[int, int, int], tuple[SpanFactors, Optional[torch.cuda.Event]]] = {}
+        self._pinned: set[int] = set()
+        self.step_h2d_bytes = 0
+        self.step_requests = 0
+        self.step_reused = 0
 
-        self._pinned_cpu: dict[tuple[int, int], SpanFactors] = {}
-        self._gpu_cache: OrderedDict[tuple[int, int], SpanFactors] = OrderedDict()
-        self._inflight: dict[tuple[int, int], tuple[SpanFactors, torch.cuda.Event]] = {}
+    def start_step(self) -> None:
+        self.step_h2d_bytes = 0
+        self.step_requests = 0
+        self.step_reused = 0
 
-    def _pin_cpu_factors(self, key: tuple[int, int], factors: SpanFactors) -> SpanFactors:
-        if key in self._pinned_cpu:
-            return self._pinned_cpu[key]
+    def _pin(self, factors: SpanFactors) -> None:
+        if not self.cuda or id(factors) in self._pinned or factors.U_k.device.type != "cpu":
+            return
+        for name in ("U_k", "s_k", "Vmat_k", "U_v", "s_v", "Vmat_v"):
+            setattr(factors, name, getattr(factors, name).pin_memory())
+        self._pinned.add(id(factors))
 
-        if factors.U_k.device.type != "cpu":
-            self._pinned_cpu[key] = factors
-            return factors
+    def _group_factors(self, factors: SpanFactors, group: int) -> SpanFactors:
+        rk, rv = max(1, factors.rank_k[group]), max(1, factors.rank_v[group])
 
-        pinned = SpanFactors(
-            U_k=factors.U_k.pin_memory(),
-            s_k=factors.s_k.pin_memory(),
-            Vmat_k=factors.Vmat_k.pin_memory(),
-            U_v=factors.U_v.pin_memory(),
-            s_v=factors.s_v.pin_memory(),
-            Vmat_v=factors.Vmat_v.pin_memory(),
-            valid_rank=int(factors.valid_rank),
+        def _move(t: torch.Tensor, r: int) -> torch.Tensor:
+            return t[group : group + 1, ..., :r].to(device=self.device, non_blocking=True).to(self.dtype)
+
+        return SpanFactors(
+            U_k=_move(factors.U_k, rk),
+            s_k=_move(factors.s_k, rk),
+            Vmat_k=_move(factors.Vmat_k, rk),
+            U_v=_move(factors.U_v, rv),
+            s_v=_move(factors.s_v, rv),
+            Vmat_v=_move(factors.Vmat_v, rv),
+            rank_k=[rk],
+            rank_v=[rv],
+            energy_k=factors.energy_k[group : group + 1],
+            energy_v=factors.energy_v[group : group + 1],
+            gated=factors.gated,
         )
-        self._pinned_cpu[key] = pinned
-        return pinned
 
-    def request(self, layer: int, span_id: int, factors: SpanFactors) -> None:
-        key = (int(layer), int(span_id))
-        if key in self._gpu_cache or key in self._inflight:
+    def _issue(self, layer: int, layer_mem: LayerMemory, span_idx: int, group: int) -> None:
+        span = layer_mem.spans[span_idx]
+        key = (layer, span.start, group)
+        if key in self._inflight or span.factors is None:
             return
+        self._pin(span.factors)
+        self.step_h2d_bytes += span.factors.group_nbytes(group)
+        if self.cuda:
+            with torch.cuda.stream(self.stream):
+                moved = self._group_factors(span.factors, group)
+                event = torch.cuda.Event()
+                event.record(self.stream)
+        else:
+            moved, event = self._group_factors(span.factors, group), None
+        self._inflight[key] = (moved, event)
 
-        if not self.cuda_enabled:
-            return
+    def prepare(self, layer: int, layer_mem: LayerMemory, requests: list[tuple[int, int]]) -> None:
+        wanted = {(layer, layer_mem.spans[s].start, g) for s, g in requests}
+        for key in [k for k in self._recon if k[0] == layer and k not in wanted]:
+            del self._recon[key]
 
-        src = self._pin_cpu_factors(key, factors)
-        with torch.cuda.stream(self.stream):
-            gpu = _span_factors_to_device(src, device=self.device, non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(self.stream)
-        self._inflight[key] = (gpu, event)
+        self.step_requests += len(requests)
+        for span_idx, group in requests:
+            key = (layer, layer_mem.spans[span_idx].start, group)
+            if key in self._recon:
+                self.step_reused += 1
+                continue
+            self._issue(layer, layer_mem, span_idx, group)
 
-    def get(self, layer: int, span_id: int) -> SpanFactors | None:
-        key = (int(layer), int(span_id))
-
-        cached = self._gpu_cache.get(key)
+    def get(self, layer: int, layer_mem: LayerMemory, span_idx: int, group: int) -> tuple[torch.Tensor, torch.Tensor]:
+        span = layer_mem.spans[span_idx]
+        key = (layer, span.start, group)
+        cached = self._recon.get(key)
         if cached is not None:
-            self._gpu_cache.move_to_end(key)
             return cached
 
-        inflight = self._inflight.get(key)
-        if inflight is None:
-            return None
+        if key not in self._inflight:
+            self._issue(layer, layer_mem, span_idx, group)
+        factors, event = self._inflight.pop(key)
+        if event is not None:
+            current = torch.cuda.current_stream(self.device)
+            current.wait_event(event)
+            for name in ("U_k", "s_k", "Vmat_k", "U_v", "s_v", "Vmat_v"):
+                getattr(factors, name).record_stream(current)
 
-        factors, event = inflight
-        if self.cuda_enabled and not event.query():
-            return None
+        cos, sin = self.rope_fn(torch.arange(span.start, span.stop, device=self.device))
+        k_hat, v_hat = reconstruct_span_kv(span, cos, sin, group=0, device=self.device, factors=factors)
+        result = (k_hat.to(self.dtype), v_hat.to(self.dtype))
+        self._recon[key] = result
+        return result
 
-        if self.cuda_enabled:
-            event.synchronize()
-        self._inflight.pop(key, None)
-        self._gpu_cache[key] = factors
-        self._gpu_cache.move_to_end(key)
-        self.evict_if_needed()
-        return factors
+    def finish_layer(self, layer: int, layer_mem: LayerMemory, requests: list[tuple[int, int]]) -> None:
+        del layer_mem, requests
+        for key in [k for k in self._inflight if k[0] == layer]:
+            del self._inflight[key]
 
-    def evict_if_needed(self) -> None:
-        while len(self._gpu_cache) > self.max_cached_spans:
-            self._gpu_cache.popitem(last=False)
-
-
-def _compressed_span_indices(layer_mem: LayerMemory) -> list[int]:
-    return [i for i, span in enumerate(layer_mem.spans) if not span.full_resolution]
-
-
-def _assert_budget_residency(
-    layer_mem: LayerMemory,
-    compressed_span_ids: list[int],
-    per_group_sets: list[set[int]],
-    budget: int | None,
-) -> None:
-    if budget is None:
-        return
-
-    num_anchors = int(layer_mem.anchor_k.size(1))
-    num_full_tokens = sum(int(span.length) for span in layer_mem.spans if span.full_resolution)
-    num_compressed = len(compressed_span_ids)
-    persistent = num_anchors + num_full_tokens + num_compressed
-
-    if persistent > budget:
-        raise ValueError(
-            f"Persistent KV residency ({persistent}) exceeds budget ({budget})"
-        )
-
-    for group_idx, comp_set in enumerate(per_group_sets):
-        extra = 0
-        for comp_idx in comp_set:
-            span_id = compressed_span_ids[comp_idx]
-            extra += max(0, int(layer_mem.spans[span_id].length) - 1)
-        total = persistent + extra
-        if total > budget:
-            raise RuntimeError(
-                f"Budget violated at group {group_idx}: residency={total}, budget={budget}"
-            )
+    def mean_rank(self, layer_mem: LayerMemory, requests: list[tuple[int, int]]) -> float:
+        ranks = []
+        for span_idx, group in requests:
+            f = layer_mem.spans[span_idx].factors
+            if f is not None:
+                ranks.append(0.5 * (f.rank_k[group] + f.rank_v[group]))
+        return sum(ranks) / len(ranks) if ranks else 0.0
 
 
-def _per_group_reconstruction_sets(
-    alpha_tilde: torch.Tensor,
-    tau_layer: torch.Tensor,
-    span_lengths: torch.Tensor,
-    layer_mem: LayerMemory,
-    spec: ModelSpec,
-    budget: int | None,
-) -> list[set[int]]:
-    # alpha_tilde: [num_compressed_spans, H]
-    groups: list[set[int]] = [set() for _ in range(spec.num_kv_heads)]
-    num_compressed = int(alpha_tilde.size(0))
-    if num_compressed == 0:
-        return groups
-
-    for group in range(spec.num_kv_heads):
-        h0 = group * spec.group_size
-        h1 = h0 + spec.group_size
-
-        if budget is None:
-            selected = alpha_tilde[:, h0:h1] > tau_layer[h0:h1].unsqueeze(0)
-            for idx in range(num_compressed):
-                if torch.any(selected[idx]):
-                    groups[group].add(idx)
-        else:
-            select_matrix: list[torch.Tensor] = []
-            for h in range(h0, h1):
-                sel_h = budget_select(
-                    alpha_tilde_head=alpha_tilde[:, h],
-                    tau_head=tau_layer[h],
-                    span_lengths=span_lengths,
-                    layer_mem=layer_mem,
-                    budget=budget,
-                )
-                select_matrix.append(sel_h)
-            selected = torch.stack(select_matrix, dim=1)
-            for idx in range(num_compressed):
-                if torch.any(selected[idx]):
-                    groups[group].add(idx)
-
-    return groups
+# Backwards-compatible name for the async factor prefetcher.
+SVDPrefetcher = ZoomCache
 
 
-def _ensure_factors_for_layer(
-    layer_mem: LayerMemory,
-    compressed_span_ids: list[int],
-    per_group_sets: list[set[int]],
-    prefetcher: SVDPrefetcher | None,
-    layer: int,
-    device: torch.device,
-) -> None:
-    if not compressed_span_ids:
-        return
-
-    # Request prefetch for routed spans first.
-    for group, comp_set in enumerate(per_group_sets):
-        del group
-        for comp_idx in comp_set:
-            span_id = compressed_span_ids[comp_idx]
-            span = layer_mem.spans[span_id]
-            if span.factors is None:
-                continue
-            if prefetcher is not None:
-                prefetcher.request(layer=layer, span_id=span_id, factors=span.factors)
-
-    # Ensure factors are resident before reconstruction. Async and sync paths must be numerically
-    # identical; fallback blocking copies preserve correctness when prefetch misses timing.
-    for comp_idx in set().union(*per_group_sets) if per_group_sets else set():
-        span_id = compressed_span_ids[comp_idx]
-        span = layer_mem.spans[span_id]
-        if span.factors is None:
-            continue
-
-        cached = prefetcher.get(layer=layer, span_id=span_id) if prefetcher is not None else None
-        if cached is not None:
-            span.factors = cached
-            continue
-
-        span.factors = _span_factors_to_device(span.factors, device=device, non_blocking=False)
-
-
-def _request_next_layer_prefetch(
-    memory: SpanMemory,
-    current_layer: int,
-    compressed_span_ids: list[int],
-    per_group_sets: list[set[int]],
-    prefetcher: SVDPrefetcher | None,
-) -> None:
-    if prefetcher is None:
-        return
-
-    next_layer = current_layer + 1
-    if next_layer >= len(memory.layers):
-        return
-
-    next_layer_mem = memory.layers[next_layer]
-    for comp_idx in set().union(*per_group_sets) if per_group_sets else set():
-        span_id = compressed_span_ids[comp_idx]
-        span = next_layer_mem.spans[span_id]
-        if span.factors is not None:
-            prefetcher.request(layer=next_layer, span_id=span_id, factors=span.factors)
-
-
-def _layer_residency_stats(
-    layer_mem: LayerMemory,
-    compressed_span_ids: list[int],
-    per_group_sets: list[set[int]],
-    modules: SeKVModules,
-    memory: SpanMemory,
-    layer: int,
-    device: torch.device,
-) -> tuple[int, float, float]:
-    num_anchors = int(layer_mem.anchor_k.size(1))
-    num_full_tokens = sum(int(span.length) for span in layer_mem.spans if span.full_resolution)
-    num_compressed = len(compressed_span_ids)
-    persistent = num_anchors + num_full_tokens + num_compressed
-
-    if num_compressed == 0:
-        return persistent, 0.0, 0.0
-
-    per_group_residency: list[int] = []
-    per_group_expand_rate: list[float] = []
-    eff_rank_values: list[float] = []
-
-    for group, comp_set in enumerate(per_group_sets):
-        extra = 0
-        for comp_idx in comp_set:
-            span_id = compressed_span_ids[comp_idx]
-            extra += max(0, int(layer_mem.spans[span_id].length) - 1)
-        per_group_residency.append(persistent + extra)
-        per_group_expand_rate.append(float(len(comp_set)) / float(max(1, num_compressed)))
-
-        for comp_idx in comp_set:
-            span_id = compressed_span_ids[comp_idx]
-            factors = memory.layers[layer].spans[span_id].factors
-            if factors is None:
-                continue
-
-            rank = int(factors.valid_rank)
-            r_max = modules.g_phi.r_max
-            valid_rank = torch.tensor([rank], device=device, dtype=torch.long)
-
-            ctx = layer_mem.spans[span_id].k_bar[group].to(device=device, dtype=torch.float32)
-            ctx = ctx / ctx.norm(p=2).clamp_min(1.0e-8)
-            ctx = ctx.unsqueeze(0)
-
-            svk = factors.s_k[group].to(device=device, dtype=torch.float32)
-            svv = factors.s_v[group].to(device=device, dtype=torch.float32)
-
-            svk_pad = torch.zeros((1, r_max), device=device, dtype=torch.float32)
-            svv_pad = torch.zeros((1, r_max), device=device, dtype=torch.float32)
-            svk_pad[:, :rank] = svk
-            svv_pad[:, :rank] = svv
-
-            gk = modules.g_phi(singular_values=svk_pad, context=ctx, valid_rank=valid_rank)
-            gv = modules.g_phi(singular_values=svv_pad, context=ctx, valid_rank=valid_rank)
-            eff_rank_values.append(float(gk.sum().item()))
-            eff_rank_values.append(float(gv.sum().item()))
-
-    residency = max(per_group_residency) if per_group_residency else persistent
-    mean_expand = (
-        sum(per_group_expand_rate) / float(len(per_group_expand_rate))
-        if per_group_expand_rate
-        else 0.0
-    )
-    mean_rank = (
-        sum(eff_rank_values) / float(len(eff_rank_values))
-        if eff_rank_values
-        else 0.0
-    )
-    return residency, mean_expand, mean_rank
+def _autocast(backbone: FrozenBackbone):
+    if backbone.model.dtype == torch.bfloat16:
+        return torch.autocast(device_type=backbone.model.device.type, dtype=torch.bfloat16)
+    return nullcontext()
 
 
 def sekv_forward_token(
@@ -439,144 +264,62 @@ def sekv_forward_token(
     adapter: ArchAdapter,
     modules: SeKVModules,
     memory: SpanMemory,
-    hidden_or_ids,
+    token_id: torch.Tensor,
     position: int,
     cfg: SeKVConfig,
-    budget: int | None,
-    prefetcher: SVDPrefetcher | None,
-    residency_callback: Callable[[int, float, float], None] | None = None,
-) -> torch.Tensor:
-    """One decode step with frozen per-layer stack and SeKV mixed-resolution attention."""
+    budget: float | None,
+    cache: ZoomCache,
+) -> tuple[torch.Tensor, StepStats]:
+    """One decode step: the token's own KV joins the local window, then every layer attends over
+    anchors, window, coarse entries, and zoomed-in spans in a single softmax."""
     spec = backbone.spec
     device = backbone.model.device
-    autocast_enabled = backbone.model.dtype == torch.bfloat16
+    cache.start_step()
 
-    if isinstance(hidden_or_ids, torch.Tensor) and hidden_or_ids.dtype in {
-        torch.int8,
-        torch.int16,
-        torch.int32,
-        torch.int64,
-        torch.uint8,
-    }:
-        token_id = hidden_or_ids
-        if token_id.ndim == 0:
-            token_id = token_id.unsqueeze(0)
-        if token_id.ndim > 1:
-            token_id = token_id.reshape(-1)
-        token_id = token_id.to(device=device, dtype=torch.long)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-            x = adapter.embed_tokens(token_id.unsqueeze(0)).squeeze(0).squeeze(0)
-    elif isinstance(hidden_or_ids, torch.Tensor):
-        x = hidden_or_ids.to(device=device, dtype=torch.float32)
-    else:
-        raise TypeError("hidden_or_ids must be a Tensor token id or hidden state")
+    resident: list[float] = []
+    expand: list[float] = []
+    ranks: list[float] = []
 
-    tau_layer_all = modules.tau.to(device=device, dtype=torch.float32)
-    layer_residencies: list[int] = []
-    layer_expand_rates: list[float] = []
-    layer_eff_ranks: list[float] = []
-
-    for layer_idx in range(spec.num_layers):
-        layer_mem = memory.layers[layer_idx]
-
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+    with _autocast(backbone):
+        x = adapter.embed_tokens(token_id.reshape(1).to(device=device, dtype=torch.long)).reshape(-1)
+        for layer_idx in range(spec.num_layers):
+            layer_mem = memory.layers[layer_idx]
             attn_in = adapter.input_layernorm(layer_idx, x)
-        q_heads, _k_heads, _v_heads = adapter.project_qkv(layer_idx, attn_in)
-        q_heads = adapter.apply_rope_q(layer_idx, q_heads.to(dtype=torch.float32), position=position)
+            q, k, v = adapter.project_qkv(layer_idx, attn_in)
+            q = adapter.apply_rope(q, position)
+            k = adapter.apply_rope(k, position)
+            layer_mem.append_window(k, v)
 
-        compressed_span_ids = _compressed_span_indices(layer_mem)
-        if compressed_span_ids:
-            k_bar = torch.stack([layer_mem.spans[sid].k_bar for sid in compressed_span_ids], dim=0)
-            k_bar = k_bar.to(device=device, dtype=torch.float32)
-            span_lengths = torch.tensor(
-                [layer_mem.spans[sid].length for sid in compressed_span_ids],
-                device=device,
-                dtype=torch.float32,
-            )
-
-            K_bar = modules.routing_summaries(layer_idx, k_bar)
-            q_proj_route = modules.project_query(layer_idx, q_heads)
-            alpha_tilde = modules.relevance_gate(q_proj_route, K_bar, span_lengths)
-
-            per_group_sets = _per_group_reconstruction_sets(
-                alpha_tilde=alpha_tilde,
-                tau_layer=tau_layer_all[layer_idx],
-                span_lengths=span_lengths,
+            out, info = decode_step_layer(
+                q_layer=q,
                 layer_mem=layer_mem,
-                spec=spec,
-                budget=budget,
-            )
-
-            _assert_budget_residency(
-                layer_mem=layer_mem,
-                compressed_span_ids=compressed_span_ids,
-                per_group_sets=per_group_sets,
-                budget=budget,
-            )
-
-            _request_next_layer_prefetch(
-                memory=memory,
-                current_layer=layer_idx,
-                compressed_span_ids=compressed_span_ids,
-                per_group_sets=per_group_sets,
-                prefetcher=prefetcher,
-            )
-
-            _ensure_factors_for_layer(
-                layer_mem=layer_mem,
-                compressed_span_ids=compressed_span_ids,
-                per_group_sets=per_group_sets,
-                prefetcher=prefetcher,
-                layer=layer_idx,
-                device=device,
-            )
-
-            layer_residency, layer_expand, layer_rank = _layer_residency_stats(
-                layer_mem=layer_mem,
-                compressed_span_ids=compressed_span_ids,
-                per_group_sets=per_group_sets,
                 modules=modules,
-                memory=memory,
                 layer=layer_idx,
-                device=device,
+                spec=spec,
+                cfg=cfg,
+                budget=budget,
+                training=False,
+                reconstructor=cache,
+                return_info=True,
             )
-            layer_residencies.append(layer_residency)
-            layer_expand_rates.append(layer_expand)
-            layer_eff_ranks.append(layer_rank)
-        else:
-            num_anchors = int(layer_mem.anchor_k.size(1))
-            num_full_tokens = sum(int(span.length) for span in layer_mem.spans if span.full_resolution)
-            layer_residencies.append(num_anchors + num_full_tokens)
-            layer_expand_rates.append(0.0)
-            layer_eff_ranks.append(0.0)
+            resident.append(info.resident_tokens)
+            expand.append(float(info.head_fine.float().mean().item()) if info.head_fine.numel() else 0.0)
+            requests = [(info.comp_ids[s], g) for s, g in info.expanded.nonzero(as_tuple=False).tolist()]
+            if requests:
+                ranks.append(cache.mean_rank(layer_mem, requests))
 
-        attn_heads = decode_step_layer(
-            q_layer=q_heads,
-            layer_mem=layer_mem,
-            modules=modules,
-            layer=layer_idx,
-            spec=spec,
-            cfg=cfg,
-            budget=budget,
-            training=False,
-            ste_temperature=float(cfg.routing.ste_temperature),
-        )
+            x = adapter.decoder_layer_forward(layer_idx, x, adapter.project_attention_output(layer_idx, out))
 
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-            attn_out = adapter.project_attention_output(layer_idx, attn_heads)
-        x = adapter.decoder_layer_forward(layer_idx, x, attn_out)
+        logits = adapter.lm_head(adapter.final_norm(x)).reshape(-1)
 
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-        x = adapter.final_norm(x)
-        logits = adapter.lm_head(x).squeeze(0)
-
-    if residency_callback is not None:
-        residency_callback(
-            int(max(layer_residencies) if layer_residencies else 0),
-            float(sum(layer_expand_rates) / float(max(1, len(layer_expand_rates)))),
-            float(sum(layer_eff_ranks) / float(max(1, len(layer_eff_ranks)))),
-        )
-    return logits.to(dtype=torch.float32)
+    stats = StepStats(
+        resident_kv_tokens=max(resident) if resident else 0.0,
+        expansion_rate=sum(expand) / max(1, len(expand)),
+        effective_rank=sum(ranks) / len(ranks) if ranks else 0.0,
+        h2d_bytes=int(cache.step_h2d_bytes),
+        reuse_rate=float(cache.step_reused) / float(cache.step_requests) if cache.step_requests else 0.0,
+    )
+    return logits.to(dtype=torch.float32), stats
 
 
 @torch.no_grad()
@@ -586,60 +329,72 @@ def generate(
     input_ids: torch.Tensor,
     cfg: SeKVConfig,
     gen_cfg: GenerationConfig,
-    residency_callback: Callable[[int, float, float], None] | None = None,
+    residency_callback: Optional[Callable[..., None]] = None,
 ) -> torch.Tensor:
-    """Greedy generation with fixed prompt span memory and optional budgeted expansion."""
+    """Greedy generation with SeKV span memory under an optional GPU-resident KV budget.
+
+    Raises BudgetTooSmallError when the resident state (anchors, window, summaries, coarse
+    entries) cannot fit in the budget; such inputs fall outside SeKV's operating range.
+    """
     if gen_cfg.max_new_tokens < 0:
         raise ValueError(f"max_new_tokens must be >= 0, got {gen_cfg.max_new_tokens}")
 
     modules.eval()
-    for p in modules.parameters():
-        p.requires_grad = False
-
-    prompt_ids = _ensure_1d_input_ids(input_ids).to(device=backbone.model.device)
-
-    autocast_enabled = backbone.model.dtype == torch.bfloat16
-    with torch.autocast(
-        device_type=backbone.model.device.type,
-        dtype=torch.bfloat16,
-        enabled=autocast_enabled,
-    ):
-        prefill = backbone.prefill(prompt_ids.unsqueeze(0))
-
-    seg = segment_prefill(prefill=prefill, input_ids=prompt_ids, cfg=cfg.segmentation)
-    memory = build_span_memory(prefill=prefill, seg=seg, cfg=cfg, spec=backbone.spec)
+    device = backbone.model.device
+    spec = backbone.spec
     adapter = build_arch_adapter(backbone)
+    prompt_ids = _ensure_1d_input_ids(input_ids).to(device=device)
+    n = int(prompt_ids.numel())
+    if n == 0:
+        raise ValueError("prompt must contain at least one token")
 
-    prefetcher: SVDPrefetcher | None
-    if backbone.model.device.type == "cuda" and torch.cuda.is_available():
-        prefetcher = SVDPrefetcher(device=backbone.model.device, max_cached_spans=256)
-    else:
-        prefetcher = None
+    window = int(cfg.memory.local_window)
+    roll = max(1, int(cfg.segmentation.l_gap))
 
+    with _autocast(backbone):
+        prefill = backbone.prefill(prompt_ids.unsqueeze(0))
+    seg = segment_sequence(prefill.surprisal, cfg.segmentation)
+    layout = memory_layout(seg, n - 1, window)
+    # The last prompt token is re-encoded by the first decode step, which appends its own KV.
+    memory = build_span_memory(prefill, seg, layout, cfg, spec, adapter.rope_cos_sin, modules=modules, window_stop=n - 1)
+    surprisal = prefill.surprisal.clone()
+    del prefill
+
+    budget = resolve_budget(gen_cfg.budget, n)
+    if budget is not None:
+        peak_window = min(window + roll, memory.layers[0].window_len + max(1, gen_cfg.max_new_tokens))
+        extra = peak_window - memory.layers[0].window_len
+        floor = max(persistent_tokens(lm, spec, modules.summary_dim, extra_window=extra) for lm in memory.layers)
+        if floor > budget:
+            raise BudgetTooSmallError(
+                f"Resident state needs {floor:.1f} tokens per KV head but the budget is {budget:.1f} "
+                f"(context {n} tokens)"
+            )
+
+    cache = ZoomCache(device=device, rope_fn=adapter.rope_cos_sin, dtype=backbone.model.dtype)
     tokens = prompt_ids.clone()
 
-    for _ in range(gen_cfg.max_new_tokens):
-        current_token = tokens[-1]
-        position = int(tokens.numel() - 1)
-
-        logits = sekv_forward_token(
-            backbone=backbone,
-            adapter=adapter,
-            modules=modules,
-            memory=memory,
-            hidden_or_ids=current_token,
-            position=position,
-            cfg=cfg,
-            budget=gen_cfg.budget,
-            prefetcher=prefetcher,
-            residency_callback=residency_callback,
+    for step in range(gen_cfg.max_new_tokens):
+        position = n - 1 + step
+        logits, stats = sekv_forward_token(
+            backbone, adapter, modules, memory, tokens[-1], position, cfg, budget, cache,
         )
-
         next_token = torch.argmax(logits, dim=-1).to(dtype=torch.long).view(1)
+        token_surprisal = -torch.log_softmax(logits, dim=-1)[next_token].to("cpu", torch.float32)
+        surprisal = torch.cat([surprisal, token_surprisal])
         tokens = torch.cat([tokens, next_token.to(device=tokens.device)], dim=0)
 
+        if residency_callback is not None:
+            residency_callback(
+                stats.resident_kv_tokens, stats.expansion_rate, stats.effective_rank,
+                stats.h2d_bytes, stats.reuse_rate,
+            )
         if gen_cfg.eos_token_id is not None and int(next_token.item()) == int(gen_cfg.eos_token_id):
             break
+
+        # Keep the local window bounded: its oldest tokens become a new span (non-evicting).
+        if memory.layers[0].window_len >= window + roll:
+            roll_window(memory, roll, surprisal, cfg, adapter.rope_cos_sin, modules, offload=True)
 
     return tokens
 
@@ -651,40 +406,35 @@ def generate_text(
     cfg: SeKVConfig,
     gen_cfg: GenerationConfig,
     apply_chat_template: bool,
-    residency_callback: Callable[[int, float, float], None] | None = None,
+    residency_callback: Optional[Callable[..., None]] = None,
 ) -> str:
     """Tokenize prompt, run SeKV generation, and decode only new tokens."""
     tokenizer = backbone.tokenizer
 
-    if backbone.spec.is_instruct and apply_chat_template:
-        if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
-            input_ids = tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors="pt",
-            )
-        else:
-            input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
+    if backbone.spec.is_instruct and apply_chat_template and getattr(tokenizer, "chat_template", None):
+        input_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt",
+        )
     else:
         input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
 
     input_ids = input_ids.to(device=backbone.model.device)
-    full = generate(
-        backbone,
-        modules,
-        input_ids=input_ids,
-        cfg=cfg,
-        gen_cfg=gen_cfg,
-        residency_callback=residency_callback,
-    )
+    full = generate(backbone, modules, input_ids=input_ids, cfg=cfg, gen_cfg=gen_cfg, residency_callback=residency_callback)
 
     prompt_len = int(_ensure_1d_input_ids(input_ids).numel())
     new_tokens = full[prompt_len:]
     if new_tokens.numel() == 0:
         return ""
-
     return tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+
+
+def parse_budget(raw: str | None) -> float | None:
+    if raw is None or str(raw).strip().lower() in {"", "none", "null"}:
+        return None
+    return float(raw)
 
 
 def _parse_args():
@@ -694,7 +444,12 @@ def _parse_args():
     parser.add_argument("--config", type=str, default="sekv/configs/default.yaml")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--prompt", type=str, required=True)
-    parser.add_argument("--budget", type=str, default="none")
+    parser.add_argument(
+        "--budget",
+        type=str,
+        default="none",
+        help="GPU-resident KV budget: 'none', a fraction of Full KV (e.g. 0.1), or tokens per KV head (e.g. 4096)",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--apply-chat-template", action="store_true")
@@ -706,13 +461,11 @@ def main() -> None:
     overrides = {"model.name": args.model} if args.model else None
     cfg = load_config(args.config, overrides=overrides)
 
-    budget = None if str(args.budget).lower() in {"none", "null"} else int(args.budget)
-
     backbone = FrozenBackbone(cfg.model)
     modules = load_sekv_checkpoint(args.checkpoint, backbone)
     gen_cfg = GenerationConfig(
         max_new_tokens=int(args.max_new_tokens),
-        budget=budget,
+        budget=parse_budget(args.budget),
         eos_token_id=backbone.tokenizer.eos_token_id,
     )
 

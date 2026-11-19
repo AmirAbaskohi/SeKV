@@ -3,15 +3,18 @@ model:
   hf_id: null
   dtype: bfloat16
   device_map: auto
-  attn_implementation: eager
+  attn_implementation: sdpa
 
 segmentation:
   alpha: 1.0
-  l_min: 4
+  l_gap: 64
+  l_min: 16
 
 memory:
   r_max: 32
   summary_dim: 32
+  local_window: 512
+  gate_eps: 0.05
 
 routing:
   tau_init: 0.05
@@ -32,7 +35,8 @@ train:
   max_steps: 3000
   batch_size: 8
   curriculum: [8192, 16384, 32768]
-  mining_window: 512
+  query_candidates: 128
+  queries_per_seq: 16
   budget_anneal_frac: 0.5
 
 paths:
@@ -44,7 +48,7 @@ eval:
   benchmarks: [longbench, ruler, niah, infinitebench, gsm8k]
   data_dir: data
   max_samples_per_task: null
-  budgets: [null, 512, 1024, 2048]
+  budgets: [null, 0.05, 0.1, 0.2]
   tensor_parallel_threshold: 24000
   output_dir: outputs/eval
   longbench_dataset: THUDM/LongBench

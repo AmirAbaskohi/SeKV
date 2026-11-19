@@ -2,24 +2,28 @@ from __future__ import annotations
 
 import argparse
 import os
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 from sekv.arch import ArchAdapter, build_arch_adapter
-from sekv.attention import decode_step_layer, ste_zoom_gate
+from sekv.attention import decode_step_layer
 from sekv.backbone import FrozenBackbone
 from sekv.config import SeKVConfig, TrainConfig, load_config
 from sekv.data import RedPajamaLongDocuments, curriculum_schedule
 from sekv.losses import budget_loss, distill_loss, recon_loss, total_loss, zoom_loss
-from sekv.memory import SpanMemory, build_span_memory, effective_rank
-from sekv.modules import SeKVModules
-from sekv.segmentation import segment_prefill
-from sekv.teacher import build_teacher_signals
+from sekv.memory import SpanMemory, build_span_memory, derive_layer, memory_view, reconstruct_span
+from sekv.modules import KIND_KEY, KIND_VALUE, SeKVModules
+from sekv.rope import apply_rope
+from sekv.segmentation import memory_layout, segment_sequence
+from sekv.teacher import build_teacher_signals, candidate_query_positions, coverage_targets
 
 
 def build_optimizer(modules: SeKVModules, cfg: TrainConfig) -> torch.optim.Optimizer:
@@ -42,46 +46,142 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig):
 
 
 def budget_anneal(step: int, max_steps: int, cfg: SeKVConfig) -> float:
-    """Linear ramp of lambda_budget then hold constant."""
+    """Linear ramp of lambda_budget from 0 over the first budget_anneal_frac of training, then hold."""
     del max_steps
-    frac = float(cfg.train.budget_anneal_frac)
-    ramp_steps = max(1, int(cfg.train.max_steps * frac))
+    ramp_steps = max(1, int(cfg.train.max_steps * float(cfg.train.budget_anneal_frac)))
     if step >= ramp_steps:
         return float(cfg.loss.lambda_budget)
     return float(cfg.loss.lambda_budget) * (float(step) / float(ramp_steps))
 
 
-def _student_logits_for_position(
+def _autocast(backbone: FrozenBackbone):
+    device = backbone.model.device
+    if backbone.model.dtype == torch.bfloat16:
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    return nullcontext()
+
+
+@dataclass
+class _TrainLayerState:
+    """Per-sequence, query-independent tensors of one layer (shared by all sampled positions)."""
+
+    comp_ids: list[int]
+    summaries: torch.Tensor
+    fine_k: torch.Tensor
+    fine_v: torch.Tensor
+    token_span: torch.Tensor
+    fine_cum: list[int]
+    gates_k: torch.Tensor
+    gates_v: torch.Tensor
+    sv_k: torch.Tensor
+    sv_v: torch.Tensor
+    energy_k: torch.Tensor
+    energy_v: torch.Tensor
+
+
+def _prepare_layer_states(
+    memory: SpanMemory,
+    modules: SeKVModules,
+    adapter: ArchAdapter,
+    device: torch.device,
+) -> list[_TrainLayerState]:
+    """Routing summaries, learned rank gates, and gated reconstructions of every compressed span."""
+    spec = memory.spec
+    r_max = modules.r_max
+    states: list[_TrainLayerState] = []
+
+    for layer_idx, layer_mem in enumerate(memory.layers):
+        derived = derive_layer(layer_mem)
+        comp = [layer_mem.spans[i] for i in derived.comp_ids]
+        m = len(comp)
+        k_bar = derived.k_bar.to(device)
+        summaries = modules.routing_summaries(layer_idx, k_bar) if m else torch.zeros((0, spec.num_q_heads, modules.summary_dim), device=device)
+
+        if m:
+            sv_k = torch.stack([F.pad(s.factors.s_k, (0, r_max - s.factors.s_k.size(-1))) for s in comp]).to(device)
+            sv_v = torch.stack([F.pad(s.factors.s_v, (0, r_max - s.factors.s_v.size(-1))) for s in comp]).to(device)
+            valid = torch.tensor([s.factors.s_k.size(-1) for s in comp], dtype=torch.long, device=device).view(-1, 1)
+            gates_k = modules.rank_gates(sv_k, k_bar, valid, KIND_KEY)
+            gates_v = modules.rank_gates(sv_v, k_bar, valid, KIND_VALUE)
+            energy_k = torch.stack([s.factors.energy_k for s in comp]).to(device)
+            energy_v = torch.stack([s.factors.energy_v for s in comp]).to(device)
+
+            positions = torch.cat([torch.arange(s.start, s.stop, device=device) for s in comp])
+            cos, sin = adapter.rope_cos_sin(positions)
+            k_parts, v_parts, offset = [], [], 0
+            for i, span in enumerate(comp):
+                f = span.factors
+                k_pre = reconstruct_span(f.U_k.to(device), f.s_k.to(device), f.Vmat_k.to(device), gates_k[i])
+                k_parts.append(apply_rope(k_pre, cos[offset : offset + span.length], sin[offset : offset + span.length]))
+                v_parts.append(reconstruct_span(f.U_v.to(device), f.s_v.to(device), f.Vmat_v.to(device), gates_v[i]))
+                offset += span.length
+            fine_k = torch.cat(k_parts, dim=1)
+            fine_v = torch.cat(v_parts, dim=1)
+            lengths = [s.length for s in comp]
+            token_span = torch.repeat_interleave(torch.arange(m, device=device), torch.tensor(lengths, device=device))
+            fine_cum = torch.cumsum(torch.tensor(lengths), dim=0).tolist()
+        else:
+            empty = torch.zeros((0, spec.num_kv_heads, r_max), device=device)
+            sv_k = sv_v = gates_k = gates_v = empty
+            energy_k = energy_v = torch.zeros((0, spec.num_kv_heads), device=device)
+            fine_k = fine_v = torch.zeros((spec.num_kv_heads, 0, spec.head_dim), device=device)
+            token_span = torch.zeros((0,), dtype=torch.long, device=device)
+            fine_cum = []
+
+        states.append(
+            _TrainLayerState(
+                comp_ids=list(derived.comp_ids),
+                summaries=summaries,
+                fine_k=fine_k,
+                fine_v=fine_v,
+                token_span=token_span,
+                fine_cum=fine_cum,
+                gates_k=gates_k,
+                gates_v=gates_v,
+                sv_k=sv_k,
+                sv_v=sv_v,
+                energy_k=energy_k,
+                energy_v=energy_v,
+            )
+        )
+    return states
+
+
+def _student_forward(
     backbone: FrozenBackbone,
     adapter: ArchAdapter,
     modules: SeKVModules,
-    span_memory: SpanMemory,
+    view: SpanMemory,
+    states: list[_TrainLayerState],
     position: int,
-    seq_hidden0: torch.Tensor,
+    token_id: torch.Tensor,
+    span_mass: torch.Tensor,
     cfg: SeKVConfig,
     ste_temperature: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """SeKV decode step for the token at `position`, attending to its causal memory view."""
     spec = backbone.spec
+    x = adapter.embed_tokens(token_id.view(1)).reshape(-1)
 
-    x = seq_hidden0[position].to(dtype=torch.float32)
-
-    alpha_layers: list[torch.Tensor] = []
-    z_layers: list[torch.Tensor] = []
-
-    gates_k_list: list[torch.Tensor] = []
-    sv_k_list: list[torch.Tensor] = []
-    gates_v_list: list[torch.Tensor] = []
-    sv_v_list: list[torch.Tensor] = []
+    alphas: list[torch.Tensor] = []
+    targets: list[torch.Tensor] = []
+    zs: list[torch.Tensor] = []
+    fine: list[torch.Tensor] = []
 
     for layer_idx in range(spec.num_layers):
-        layer_mem = span_memory.layers[layer_idx]
+        layer_mem = view.layers[layer_idx]
+        state = states[layer_idx]
 
         attn_in = adapter.input_layernorm(layer_idx, x)
-        q_heads, _k_heads, _v_heads = adapter.project_qkv(layer_idx, attn_in)
-        q_heads = adapter.apply_rope_q(layer_idx, q_heads.to(dtype=torch.float32), position=position)
+        q, k, v = adapter.project_qkv(layer_idx, attn_in)
+        q = adapter.apply_rope(q, position)
+        k = adapter.apply_rope(k, position)
+        layer_mem.append_window(k, v)
 
-        attn_heads = decode_step_layer(
-            q_layer=q_heads,
+        m = len(derive_layer(layer_mem).comp_ids)
+        n_tok = state.fine_cum[m - 1] if m else 0
+        out, info = decode_step_layer(
+            q_layer=q,
             layer_mem=layer_mem,
             modules=modules,
             layer=layer_idx,
@@ -90,109 +190,94 @@ def _student_logits_for_position(
             budget=None,
             training=True,
             ste_temperature=ste_temperature,
+            summaries=state.summaries[:m],
+            train_fine=(state.fine_k[:, :n_tok], state.fine_v[:, :n_tok], state.token_span[:n_tok]),
+            return_info=True,
         )
+        x = adapter.decoder_layer_forward(layer_idx, x, adapter.project_attention_output(layer_idx, out))
 
-        attn_out = adapter.project_attention_output(layer_idx, attn_heads)
-        x = adapter.decoder_layer_forward(layer_idx, x, attn_out)
+        if m:
+            comp_idx = torch.tensor(state.comp_ids[:m], dtype=torch.long)
+            y = coverage_targets(span_mass[layer_idx].index_select(-1, comp_idx), rho=cfg.loss.rho)
+            alphas.append(info.alpha.reshape(-1))
+            targets.append(y.transpose(0, 1).reshape(-1).to(info.alpha.device))
+            zs.append(info.z.reshape(-1))
+            fine.append(info.head_fine.reshape(-1).to(torch.float32))
 
-        non_full = [i for i, sp in enumerate(layer_mem.spans) if not sp.full_resolution]
-        if non_full:
-            k_bar = torch.stack([layer_mem.spans[i].k_bar for i in non_full], dim=0).to(
-                device=x.device, dtype=torch.float32
+    logits = adapter.lm_head(adapter.final_norm(x)).reshape(-1)
+
+    def _cat(parts: list[torch.Tensor]) -> torch.Tensor:
+        return torch.cat(parts) if parts else torch.zeros((0,), device=logits.device)
+
+    return logits, {"alpha": _cat(alphas), "y": _cat(targets), "z": _cat(zs), "fine": _cat(fine)}
+
+
+def _sequence_loss(
+    backbone: FrozenBackbone,
+    adapter: ArchAdapter,
+    modules: SeKVModules,
+    seq: torch.Tensor,
+    cfg: SeKVConfig,
+    budget_weight: float,
+    ste_temperature: float,
+) -> Optional[tuple[torch.Tensor, dict[str, float]]]:
+    spec = backbone.spec
+    device = backbone.model.device
+    window = int(cfg.memory.local_window)
+
+    candidates = candidate_query_positions(int(seq.numel()), cfg)
+    if not candidates:
+        return None
+
+    with torch.no_grad(), _autocast(backbone):
+        prefill = backbone.prefill(seq.unsqueeze(0), keep_hidden=True, query_positions=candidates)
+    seg = segment_sequence(prefill.surprisal, cfg.segmentation)
+    teacher = build_teacher_signals(backbone, prefill, seg, cfg, adapter.rope_cos_sin)
+    if not teacher.query_positions:
+        return None
+
+    layout_max = memory_layout(seg, max(teacher.query_positions), window)
+    if not any(not s.full_resolution for s in seg.spans[: layout_max.num_spans]):
+        return None
+    with torch.no_grad():
+        memory = build_span_memory(prefill, seg, layout_max, cfg, spec, adapter.rope_cos_sin, modules=None, offload=False)
+
+    with _autocast(backbone):
+        states = _prepare_layer_states(memory, modules, adapter, device)
+
+        student_rows, teacher_rows = [], []
+        alpha_rows, y_rows, z_rows, fine_rows = [], [], [], []
+        for pos in teacher.query_positions:
+            layout = memory_layout(seg, pos, window)
+            view = memory_view(memory, layout, prefill, window_stop=pos)
+            logits, info = _student_forward(
+                backbone, adapter, modules, view, states, pos, seq[pos].to(device),
+                teacher.span_mass[pos], cfg, ste_temperature,
             )
-            span_len = torch.tensor(
-                [layer_mem.spans[i].length for i in non_full],
-                device=x.device,
-                dtype=torch.float32,
-            )
-            q_proj_routing = modules.project_query(layer_idx, q_heads)
-            K_bar = modules.routing_summaries(layer_idx, k_bar)
-            alpha_comp = modules.relevance_gate(q_proj_routing, K_bar, span_len)
-            z_comp = ste_zoom_gate(alpha_comp, modules.tau[layer_idx].to(x.device), ste_temperature)
+            student_rows.append(logits)
+            teacher_rows.append(teacher.teacher_logits[pos].to(device))
+            alpha_rows.append(info["alpha"])
+            y_rows.append(info["y"])
+            z_rows.append(info["z"])
+            fine_rows.append(info["fine"])
 
-            alpha_full = torch.zeros(
-                (spec.num_q_heads, len(layer_mem.spans)), device=x.device, dtype=torch.float32
-            )
-            z_full = torch.zeros_like(alpha_full)
-            for c_idx, s_idx in enumerate(non_full):
-                alpha_full[:, s_idx] = alpha_comp[c_idx]
-                z_full[:, s_idx] = (alpha_comp[c_idx] > modules.tau[layer_idx].to(x.device)).to(torch.float32)
+    def _flat(name: str) -> torch.Tensor:
+        return torch.cat([getattr(s, name).reshape(-1, *getattr(s, name).shape[2:]) for s in states], dim=0)
 
-            alpha_layers.append(alpha_full)
-            z_layers.append(z_full)
-
-            r_max = int(cfg.memory.r_max)
-            gates_k_layer = torch.zeros(
-                (spec.num_kv_heads, len(layer_mem.spans), r_max), device=x.device, dtype=torch.float32
-            )
-            gates_v_layer = torch.zeros_like(gates_k_layer)
-            sv_k_layer = torch.zeros_like(gates_k_layer)
-            sv_v_layer = torch.zeros_like(gates_k_layer)
-
-            for s_idx in non_full:
-                factors = layer_mem.spans[s_idx].factors
-                if factors is None:
-                    continue
-                rank = int(factors.valid_rank)
-                valid_rank = torch.tensor([rank], dtype=torch.long, device=x.device)
-
-                for kv in range(spec.num_kv_heads):
-                    ctx = layer_mem.spans[s_idx].k_bar[kv].to(device=x.device, dtype=torch.float32)
-                    ctx = ctx / ctx.norm(p=2).clamp_min(1.0e-8)
-                    ctx = ctx.unsqueeze(0)
-
-                    svk_pad = torch.zeros((1, r_max), device=x.device, dtype=torch.float32)
-                    svv_pad = torch.zeros((1, r_max), device=x.device, dtype=torch.float32)
-
-                    svk = factors.s_k[kv].to(device=x.device, dtype=torch.float32)
-                    svv = factors.s_v[kv].to(device=x.device, dtype=torch.float32)
-                    svk_pad[:, :rank] = svk
-                    svv_pad[:, :rank] = svv
-
-                    gk = modules.g_phi(svk_pad, ctx, valid_rank).squeeze(0)
-                    gv = modules.g_phi(svv_pad, ctx, valid_rank).squeeze(0)
-
-                    gates_k_layer[kv, s_idx] = gk
-                    gates_v_layer[kv, s_idx] = gv
-                    sv_k_layer[kv, s_idx] = svk_pad.squeeze(0)
-                    sv_v_layer[kv, s_idx] = svv_pad.squeeze(0)
-
-            gates_k_list.append(gates_k_layer)
-            gates_v_list.append(gates_v_layer)
-            sv_k_list.append(sv_k_layer)
-            sv_v_list.append(sv_v_layer)
-        else:
-            alpha_layers.append(
-                torch.zeros((spec.num_q_heads, len(layer_mem.spans)), device=x.device, dtype=torch.float32)
-            )
-            z_layers.append(
-                torch.zeros((spec.num_q_heads, len(layer_mem.spans)), device=x.device, dtype=torch.float32)
-            )
-            gates_k_list.append(
-                torch.zeros((spec.num_kv_heads, len(layer_mem.spans), cfg.memory.r_max), device=x.device)
-            )
-            gates_v_list.append(
-                torch.zeros((spec.num_kv_heads, len(layer_mem.spans), cfg.memory.r_max), device=x.device)
-            )
-            sv_k_list.append(
-                torch.zeros((spec.num_kv_heads, len(layer_mem.spans), cfg.memory.r_max), device=x.device)
-            )
-            sv_v_list.append(
-                torch.zeros((spec.num_kv_heads, len(layer_mem.spans), cfg.memory.r_max), device=x.device)
-            )
-
-    final_norm = adapter.final_norm(x)
-    logits = adapter.lm_head(final_norm).squeeze(0)
-
-    info = {
-        "alpha_tilde": torch.stack(alpha_layers, dim=0),  # [L,H,S]
-        "z_hard": torch.stack(z_layers, dim=0),
-        "gates_k": torch.stack(gates_k_list, dim=0),  # [L,H_kv,S,R]
-        "gates_v": torch.stack(gates_v_list, dim=0),
-        "sv_k": torch.stack(sv_k_list, dim=0),
-        "sv_v": torch.stack(sv_v_list, dim=0),
+    gates_k, gates_v = _flat("gates_k"), _flat("gates_v")
+    parts = {
+        "distill": distill_loss(torch.stack(student_rows), torch.stack(teacher_rows)),
+        "zoom": zoom_loss(torch.cat(alpha_rows), torch.cat(y_rows), w_pos=cfg.loss.w_pos),
+        "recon": recon_loss(gates_k, _flat("sv_k"), gates_v, _flat("sv_v"), _flat("energy_k").reshape(-1), _flat("energy_v").reshape(-1)),
+        "budget": budget_loss(torch.cat(z_rows), gates_k, gates_v, beta=cfg.loss.beta),
     }
-    return logits, info
+    loss, logs = total_loss(parts=parts, weights=cfg.loss, budget_weight=budget_weight)
+
+    with torch.no_grad():
+        logs["mean_effective_rank"] = float(((gates_k > cfg.memory.gate_eps).sum(-1).float().mean() + (gates_v > cfg.memory.gate_eps).sum(-1).float().mean()).item() / 2.0)
+        fine_all = torch.cat(fine_rows)
+        logs["mean_expansion_rate"] = float(fine_all.mean().item()) if fine_all.numel() else 0.0
+    return loss, logs
 
 
 def train_step(
@@ -204,7 +289,7 @@ def train_step(
     step: int,
     ste_temperature: float,
 ) -> dict[str, float]:
-    """One optimization step over lightweight SeKV modules only."""
+    """One optimization step over the lightweight SeKV modules (gradients accumulated per sequence)."""
     if not hasattr(modules, "_optimizer") or not hasattr(modules, "_scheduler"):
         raise RuntimeError("train_step expects optimizer and scheduler attached on modules")
 
@@ -222,131 +307,54 @@ def train_step(
         raise ValueError(f"input_ids must be [seq_len] or [batch,seq_len], got {tuple(input_ids.shape)}")
     batch_ids = batch_ids.to(device=backbone.model.device, dtype=torch.long)
 
-    student_logits_rows: list[torch.Tensor] = []
-    teacher_logits_rows: list[torch.Tensor] = []
-    alpha_rows: list[torch.Tensor] = []
-    z_rows: list[torch.Tensor] = []
-    y_rows: list[torch.Tensor] = []
-    gates_k_rows: list[torch.Tensor] = []
-    gates_v_rows: list[torch.Tensor] = []
-    sv_k_rows: list[torch.Tensor] = []
-    sv_v_rows: list[torch.Tensor] = []
-
-    autocast_enabled = backbone.model.dtype == torch.bfloat16
-
-    for seq in batch_ids:
-        with torch.no_grad(), torch.autocast(device_type=seq.device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-            prefill = backbone.prefill(seq.unsqueeze(0))
-            seg = segment_prefill(prefill=prefill, input_ids=seq, cfg=cfg.segmentation)
-            span_memory = build_span_memory(prefill=prefill, seg=seg, cfg=cfg, spec=backbone.spec)
-
-        teacher = build_teacher_signals(
-            backbone=backbone,
-            input_ids=seq,
-            prefill=prefill,
-            seg=seg,
-            cfg=cfg,
-        )
-        if not teacher.query_positions:
-            continue
-
-        with torch.no_grad():
-            out_hidden = backbone.model(
-                input_ids=seq.unsqueeze(0),
-                use_cache=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            hidden0 = out_hidden.hidden_states[0][0].detach().to(dtype=torch.float32)
-
-        for pos in teacher.query_positions:
-            logits, info = _student_logits_for_position(
-                backbone=backbone,
-                adapter=adapter,
-                modules=modules,
-                span_memory=span_memory,
-                position=pos,
-                seq_hidden0=hidden0,
-                cfg=cfg,
-                ste_temperature=ste_temperature,
-            )
-
-            student_logits_rows.append(logits)
-            teacher_logits_rows.append(teacher.teacher_logits[pos].to(device=logits.device, dtype=torch.float32))
-
-            alpha_rows.append(info["alpha_tilde"])
-            z_rows.append(info["z_hard"])
-            y_rows.append(teacher.zoom_targets[pos].to(device=logits.device, dtype=torch.float32))
-
-            gates_k_rows.append(info["gates_k"])
-            gates_v_rows.append(info["gates_v"])
-            sv_k_rows.append(info["sv_k"])
-            sv_v_rows.append(info["sv_v"])
-
-    if not student_logits_rows:
-        return {
-            "loss": 0.0,
-            "loss_distill": 0.0,
-            "loss_zoom": 0.0,
-            "loss_recon": 0.0,
-            "loss_budget": 0.0,
-            "mean_effective_rank": 0.0,
-            "mean_expansion_rate": 0.0,
-        }
-
-    student_logits = torch.stack(student_logits_rows, dim=0)
-    teacher_logits = torch.stack(teacher_logits_rows, dim=0)
-
-    alpha_all = torch.stack(alpha_rows, dim=0)
-    z_all = torch.stack(z_rows, dim=0)
-    y_all = torch.stack(y_rows, dim=0)
-
-    gates_k = torch.stack(gates_k_rows, dim=0)
-    gates_v = torch.stack(gates_v_rows, dim=0)
-    sv_k = torch.stack(sv_k_rows, dim=0)
-    sv_v = torch.stack(sv_v_rows, dim=0)
-
-    parts = {
-        "distill": distill_loss(student_logits, teacher_logits),
-        "zoom": zoom_loss(alpha_all, y_all, w_pos=cfg.loss.w_pos),
-        "recon": recon_loss(gates_k, sv_k, gates_v, sv_v),
-        "budget": budget_loss(z_all, gates_k, gates_v, beta=cfg.loss.beta),
-    }
-
     budget_weight = budget_anneal(step=step, max_steps=cfg.train.max_steps, cfg=cfg)
-    loss, logs = total_loss(parts=parts, weights=cfg.loss, budget_weight=budget_weight)
+    results = []
+    for seq in batch_ids:
+        result = _sequence_loss(backbone, adapter, modules, seq, cfg, budget_weight, ste_temperature)
+        if result is None:
+            continue
+        loss, logs = result
+        (loss / float(batch_ids.size(0))).backward()
+        results.append(logs)
+        del loss
 
-    loss.backward()
+    keys = ["loss", "loss_distill", "loss_zoom", "loss_recon", "loss_budget", "mean_effective_rank", "mean_expansion_rate"]
+    if not results:
+        return {key: 0.0 for key in keys}
+
     torch.nn.utils.clip_grad_norm_(modules.parameters(), max_norm=1.0)
     optimizer.step()
     scheduler.step()
 
-    with torch.no_grad():
-        logs["mean_effective_rank"] = float(effective_rank(gates_k).mean().item())
-        logs["mean_expansion_rate"] = float(z_all.mean().item())
-
-    return logs
+    out = {key: sum(r[key] for r in results) / len(results) for key in keys}
+    out["budget_weight"] = budget_weight
+    return out
 
 
-def _checkpoint_state(modules: SeKVModules, backbone: FrozenBackbone, cfg: SeKVConfig, step: int) -> None:
-    ckpt_dir = Path(cfg.paths.checkpoint_dir)
+def checkpoint_dir(cfg: SeKVConfig) -> Path:
+    return Path(cfg.paths.checkpoint_dir) / cfg.model.name
+
+
+def save_checkpoint(modules: SeKVModules, backbone: FrozenBackbone, cfg: SeKVConfig, step: int, name: str) -> Path:
+    """Save trainable parameters with the config and model spec as plain dicts."""
+    ckpt_dir = checkpoint_dir(cfg)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     payload = {
         "step": int(step),
-        "model_spec": backbone.spec,
-        "config": cfg,
+        "model_spec": asdict(backbone.spec),
+        "config": asdict(cfg),
         "trainable_parameters": {
-            name: tensor.detach().cpu()
-            for name, tensor in modules.trainable_parameters().items()
+            name: tensor.detach().cpu() for name, tensor in modules.trainable_parameters().items()
         },
     }
-    path = ckpt_dir / f"sekv_step_{step:07d}.pt"
+    path = ckpt_dir / name
     torch.save(payload, path)
+    return path
 
 
 def train(cfg: SeKVConfig) -> None:
-    """Train SeKV lightweight modules with streaming data and curriculum schedule."""
+    """Train SeKV lightweight modules with streaming data and a length curriculum."""
     backbone = FrozenBackbone(cfg.model)
     adapter = build_arch_adapter(backbone)
     modules = SeKVModules(spec=backbone.spec, routing=cfg.routing, memory=cfg.memory)
@@ -374,7 +382,7 @@ def train(cfg: SeKVConfig) -> None:
         collate_fn=lambda batch: torch.stack(batch, dim=0),
         drop_last=True,
         num_workers=0,
-        pin_memory=True,
+        pin_memory=torch.cuda.is_available(),
     )
     data_iter = iter(dataloader)
 
@@ -418,9 +426,10 @@ def train(cfg: SeKVConfig) -> None:
             )
 
         if (step + 1) % ckpt_interval == 0:
-            _checkpoint_state(modules, backbone, cfg, step + 1)
+            save_checkpoint(modules, backbone, cfg, step + 1, f"step_{step + 1:07d}.pt")
 
-    _checkpoint_state(modules, backbone, cfg, cfg.train.max_steps)
+    path = save_checkpoint(modules, backbone, cfg, cfg.train.max_steps, "final.pt")
+    print(f"Saved final checkpoint to {path}")
 
 
 def _parse_args() -> argparse.Namespace:
